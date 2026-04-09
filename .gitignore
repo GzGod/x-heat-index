@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.DS_Store
+*.swp
+*.bak
+*.tmp
+
+# Local data — never commit (contains tweet content + author handles)
+data/
+
+# Local env override (should never have real secrets)
+.env

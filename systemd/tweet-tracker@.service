@@ -1,0 +1,21 @@
+[Unit]
+Description=Tweet Tracker — high-frequency snapshot of tweet %i
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tweet-tracker
+Environment=TWITTER241_RAPIDAPI_KEY=5e79be5722msh49da795168d8ec4p118874jsn5002359e5ee5
+Environment=TWITTER241_RAPIDAPI_KEY_FALLBACK=2556934a97msh50dd77a4d426b90p15c373jsn7d01a3d785d2
+Environment=TWEET_ID=%i
+Environment=DATA_DIR=/opt/tweet-tracker/data
+Environment=SNAPSHOT_INTERVAL_SEC=300
+Environment=MAX_PAGES_PER_CYCLE=10
+ExecStart=/usr/bin/python3 /opt/tweet-tracker/tracker.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/opt/tweet-tracker/tracker.log
+StandardError=append:/opt/tweet-tracker/tracker.log
+
+[Install]
+WantedBy=multi-user.target

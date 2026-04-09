@@ -1,0 +1,21 @@
+[Unit]
+Description=Cascade Walker — Phase 2 sub-engagement walker for tweet %i
+After=network.target tweet-tracker@%i.service
+Wants=tweet-tracker@%i.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tweet-tracker
+Environment=TWITTER241_RAPIDAPI_KEY=5e79be5722msh49da795168d8ec4p118874jsn5002359e5ee5
+Environment=TWITTER241_RAPIDAPI_KEY_FALLBACK=2556934a97msh50dd77a4d426b90p15c373jsn7d01a3d785d2
+Environment=TWEET_ID=%i
+Environment=DATA_DIR=/opt/tweet-tracker/data
+Environment=WALKER_INTERVAL_SEC=1800
+ExecStart=/usr/bin/python3 /opt/tweet-tracker/cascade_walker.py
+Restart=always
+RestartSec=30
+StandardOutput=append:/opt/tweet-tracker/walker.log
+StandardError=append:/opt/tweet-tracker/walker.log
+
+[Install]
+WantedBy=multi-user.target
