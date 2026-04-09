@@ -303,7 +303,7 @@ HTML = r"""<!DOCTYPE html>
       <div class="chart-card full">
         <div class="chart-title">热度曲线 & 传播速度</div>
         <div class="chart-desc">
-          橙色实线 = 累积热度（越高说明影响越大）。<br>
+          橙色实线 = XHI 综合热度（多层加权：基础权重 × 影响力系数 × 时间衰减 + 组合加成）。<br>
           蓝色虚线 = 当前每分钟新增热度（越高说明正在传播越快；接近 0 = 停滞）。
         </div>
         <div class="chart-wrap"><canvas id="chart-heat"></canvas></div>
@@ -324,11 +324,10 @@ HTML = r"""<!DOCTYPE html>
         <div class="chart-wrap"><canvas id="chart-cascade"></canvas></div>
       </div>
       <div class="chart-card full">
-        <div class="chart-title">触达人数 & 参与账户</div>
+        <div class="chart-title">预估触达 & 参与账户</div>
         <div class="chart-desc">
-          绿色实线 = 理论触达人数上限（所有参与者的粉丝总和，去重）。<br>
-          黄色虚线 = 实际参与讨论的独立账户数。<br>
-          实际看到的人 ≈ 触达人数 × 5%-15%（行业经验系数）。
+          绿色实线 = 分层加权触达（一级引用100%、一级回复30%、二级引用10%、二级回复不计，经粉丝重叠修正）。<br>
+          黄色虚线 = 实际参与讨论的独立账户数。
         </div>
         <div class="chart-wrap"><canvas id="chart-reach"></canvas></div>
       </div>
@@ -456,8 +455,9 @@ function generateNarrative(derived, cascade, cfg, stage) {
 
   // 4. 触达
   if (reach > 0) {
-    const estImpressions = Math.round(reach * 0.1); // 行业经验 ~10%
-    narr.push(`<p>这些参与者的粉丝加起来约 <strong>${fmtCompact(reach)}</strong> 人，实际看到的人预计在 <strong>${fmtCompact(estImpressions)}</strong> 左右（按行业均值 10% 估算）。</p>`);
+    const reachAdj = latestCascade.reach_adjusted || reach;
+    const discount = latestCascade.reach_overlap_discount || '—';
+    narr.push(`<p>分层加权触达约 <strong>${fmtCompact(reachAdj)}</strong> 人（毛触达 ${fmtCompact(reach)}，重叠折扣 ${discount}）。</p>`);
   }
 
   // Recommendation (promotion decision)
@@ -607,7 +607,7 @@ async function renderDashboard(tid) {
   // ── KPI row ──
   const viewsArrow = arrow(latest.view_count, prev.view_count);
   const heatArrow = arrow(latest.heat_score, prev.heat_score);
-  const reachArrow = arrow(latestCascade.reach_followers_sum, prevCascade.reach_followers_sum);
+  const reachArrow = arrow(latestCascade.reach_adjusted || latestCascade.reach_followers_sum, prevCascade.reach_adjusted || prevCascade.reach_followers_sum);
   const engagerArrow = arrow(latestCascade.unique_engager_count, prevCascade.unique_engager_count);
 
   $("kpi-row").innerHTML = [
@@ -622,8 +622,8 @@ async function renderDashboard(tid) {
       "综合热度",
       fmt(latest.heat_score || 0),
       "", heatArrow,
-      "按 点赞+转发+回复+引用 加权",
-      "一个综合指标：0.2×曝光 + 1×点赞 + 5×转发 + 2×回复 + 3×引用。权重反映参与的「主动性」：转发是主动放大，权重最高；曝光是被动，权重最低。"
+      "XHI v2 多层信号评分",
+      "XHI v2 四层评分体系：Layer 1 基础权重（Quote 5.0 > Reply 3.0 > RT 2.0 > Like 1.0 > View 0.01），Layer 2 互动者影响力加权，Layer 3 时间衰减，Layer 4 信号组合加成。"
     ),
     kpi(
       "当前传播速度",
@@ -647,11 +647,11 @@ async function renderDashboard(tid) {
       "学术上叫 Wiener index（Goel et al. 2016），通俗理解：越接近 1 = 所有人都在「直接回原帖」（浅层广播）；越高 = 「有人在回别人的回复」（真·多层讨论）。2-4 之间算健康的树状扩散。"
     ),
     kpi(
-      "触达上限",
-      fmtCompact(latestCascade.reach_followers_sum || 0),
+      "预估触达",
+      fmtCompact(latestCascade.reach_adjusted || latestCascade.reach_followers_sum || 0),
       "人", reachArrow,
-      `预计实际看到 ≈ ${fmtCompact((latestCascade.reach_followers_sum || 0) * 0.1)}`,
-      "所有参与讨论账户的粉丝总和（去重），是理论上能看到这条推文传播痕迹的人数上限。实际看到的通常是这个数的 5%-15%（行业经验系数），因为不是每个 follower 都会刷到自己 follow 的人的每条互动。"
+      `毛触达 ${fmtCompact(latestCascade.reach_gross || 0)} × 重叠折扣 ${latestCascade.reach_overlap_discount || '—'}`,
+      "分层加权触达：一级引用全额计入，一级回复按30%计入，二级引用按10%计入，二级回复不计入。结果经粉丝重叠修正（互动者越多折扣越大）。"
     ),
   ].join("");
 
@@ -697,7 +697,7 @@ async function renderDashboard(tid) {
   ], { y1: true });
 
   makeLineChart("chart-reach", [
-    { label: "触达上限 (累积粉丝数)", data: cascadePoints(d => d.reach_followers_sum), borderColor: "#3fb950", backgroundColor: "rgba(63,185,80,0.12)", fill: true, tension: 0.25, yAxisID: "y" },
+    { label: "预估触达 (分层加权)", data: cascadePoints(d => d.reach_adjusted || d.reach_followers_sum), borderColor: "#3fb950", backgroundColor: "rgba(63,185,80,0.12)", fill: true, tension: 0.25, yAxisID: "y" },
     { label: "参与独立账户数", data: cascadePoints(d => d.unique_engager_count), borderColor: "#d29922", backgroundColor: "transparent", borderWidth: 2, borderDash: [5, 5], tension: 0.25, yAxisID: "y1" },
   ], { y1: true });
 }

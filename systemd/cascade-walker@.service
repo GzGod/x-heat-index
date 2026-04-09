@@ -6,11 +6,11 @@ Wants=tweet-tracker@%i.service
 [Service]
 Type=simple
 WorkingDirectory=/opt/tweet-tracker
-Environment=TWITTER241_RAPIDAPI_KEY=5e79be5722msh49da795168d8ec4p118874jsn5002359e5ee5
-Environment=TWITTER241_RAPIDAPI_KEY_FALLBACK=2556934a97msh50dd77a4d426b90p15c373jsn7d01a3d785d2
+Environment=XAPI_API_KEY=sk-ae375f79914f27c6e29ec9aaad09448378b133df175bcac4
 Environment=TWEET_ID=%i
 Environment=DATA_DIR=/opt/tweet-tracker/data
 Environment=WALKER_INTERVAL_SEC=1800
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/python3 /opt/tweet-tracker/cascade_walker.py
 Restart=always
 RestartSec=30

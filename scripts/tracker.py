@@ -5,46 +5,38 @@ Phase 1 only (Phase 2 cascade walker is a separate script).
 
 Outputs (per tweet, in DATA_DIR/<tweet_id>/):
   metrics.jsonl   — counts every cycle (views, likes, RTs, replies, quotes, bookmarks)
-  replies.jsonl   — incremental new replies (cursor-based, dedup)
+  replies.jsonl   — incremental new replies (dedup)
   quotes.jsonl    — incremental new quotes
   derived.jsonl   — heat / velocity / reach / engagement_rate per cycle
-  state.json      — last cursors + seen IDs (for crash recovery)
+  state.json      — seen IDs (for crash recovery)
   config.json     — promotion start ts, KOL list, channels (manually edited later)
   dashboard.txt   — human-readable status, overwritten each cycle
 
+API: xapi.to via CLI (npx xapi-to call ...)
+
 Required env:
-  TWITTER241_RAPIDAPI_KEY    Twitter241 API key
-  TWEET_ID                   target tweet pid
+  XAPI_API_KEY               xapi.to API key (or pre-configured via npx xapi-to config)
+  TWEET_ID                   target tweet ID
 
 Optional env:
   DATA_DIR                   default /opt/tweet-tracker/data
   SNAPSHOT_INTERVAL_SEC      default 300 (5 min)
-  MAX_PAGES_PER_CYCLE        default 5 (cap pagination per endpoint per cycle)
 """
 
 import json
 import os
+import subprocess
 import sys
 import time
-import urllib.request
-import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
 # ──────────────────────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────────────────────
-KEY_PRIMARY = os.environ["TWITTER241_RAPIDAPI_KEY"]
-KEY_FALLBACK = os.environ.get("TWITTER241_RAPIDAPI_KEY_FALLBACK", "")
-HOST = "twitter241.p.rapidapi.com"
 TWEET_ID = os.environ["TWEET_ID"]
-
-# Mutable state: which key to use right now (switches to fallback on quota exhaustion)
-_active_key = KEY_PRIMARY
-_using_fallback = False
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/opt/tweet-tracker/data"))
 INTERVAL = int(os.environ.get("SNAPSHOT_INTERVAL_SEC", "300"))
-MAX_PAGES = int(os.environ.get("MAX_PAGES_PER_CYCLE", "5"))
 
 TWEET_DIR = DATA_DIR / TWEET_ID
 TWEET_DIR.mkdir(parents=True, exist_ok=True)
@@ -57,213 +49,159 @@ STATE_FILE = TWEET_DIR / "state.json"
 CONFIG_FILE = TWEET_DIR / "config.json"
 DASHBOARD_FILE = TWEET_DIR / "dashboard.txt"
 
-# Heat Score weights
-W_VIEWS = 0.2
+# ──────────────────────────────────────────────────────────────
+# XHI™ Signal Weight Framework v2
+# ──────────────────────────────────────────────────────────────
+
+# Layer 1: Base Signal Weights
+W_VIEWS = 0.01
 W_LIKES = 1.0
-W_RTS = 5.0
-W_REPLIES = 2.0
-W_QUOTES = 3.0
+W_RTS = 2.0
+W_REPLIES = 3.0
+W_QUOTES = 5.0
+W_QUOTES_WITH_COMMENTARY = 7.0  # Quote with >50 chars commentary
+W_REPLY_CATALYST = 4.5          # Reply that triggers sub-thread (≥3 sub-replies)
+W_BOOKMARKS = 2.0               # Latent interest (when API available)
+
+# Layer 2: Quality Multiplier thresholds
+QUALITY_TIERS = [
+    (100_000, 3.0),   # >100K followers: Tier-1 KOL
+    (10_000,  1.5),   # 10K-100K: Mid-tier
+    (1_000,   1.0),   # 1K-10K: baseline
+    (0,       0.8),   # <1K: low influence
+]
+QUALITY_NEW_ACCOUNT_DAYS = 30       # accounts younger than this
+QUALITY_NEW_ACCOUNT_MULTIPLIER = 0.3
+
+# Layer 3: Temporal Decay brackets (hours → multiplier)
+TEMPORAL_DECAY = [
+    (1,   1.0),    # 0-1h: peak window
+    (6,   0.85),   # 1-6h: active propagation
+    (24,  0.5),    # 6-24h: mid-lifecycle
+    (72,  0.2),    # 24-72h: long tail
+    (None, 0.05),  # 72h+: residual
+]
+
+# Layer 4: Cross-Signal Interaction Bonus
+BONUS_QUOTE_AND_REPLY = 2.0        # same user quotes + replies
+BONUS_CATALYST_QUOTE = 3.0         # quote triggers ≥3 sub-replies
+BONUS_BURST_QUOTES = 5.0           # ≥3 independent quotes within 10min
+BONUS_RT_TO_QUOTE_UPGRADE = 4.0    # same user RT then quote within 30min
+
+COMMENTARY_MIN_CHARS = 50          # threshold for "Quote with Commentary"
 
 
 # ──────────────────────────────────────────────────────────────
-# HTTP
+# xapi.to CLI client
 # ──────────────────────────────────────────────────────────────
-def _switch_to_fallback() -> bool:
-    """Switch to fallback key. Returns True if switched, False if no fallback."""
-    global _active_key, _using_fallback
-    if _using_fallback or not KEY_FALLBACK:
-        return False
-    _using_fallback = True
-    _active_key = KEY_FALLBACK
-    print(f"[{now_iso()}] [QUOTA] primary key exhausted, switching to fallback", flush=True)
-    return True
-
-
-def call_api(path: str, retries: int = 3) -> dict:
-    """Call Twitter241 endpoint, return parsed JSON.
-
-    Auto-switches to fallback key on 429 (rate limit) or body-level quota errors.
-    """
-    url = f"https://{HOST}{path}"
+def xapi_call(action: str, params: dict, retries: int = 3) -> dict:
+    """Call xapi.to via CLI, return parsed JSON response."""
+    cmd = ["npx", "xapi-to", "call", action, "--input", json.dumps(params)]
     last_err = None
     for attempt in range(retries):
-        headers = {"x-rapidapi-key": _active_key, "x-rapidapi-host": HOST}
         try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read())
-                # Twitter241 / RapidAPI sometimes returns 200 + body error on quota out
-                if isinstance(data, dict) and data.get("message", "").lower().startswith("you have exceeded"):
-                    if _switch_to_fallback():
-                        continue
-                    raise RuntimeError(f"quota exhausted: {data.get('message')}")
-                return data
-        except urllib.error.HTTPError as e:
-            last_err = e
-            if e.code == 429:
-                if _switch_to_fallback():
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                last_err = RuntimeError(f"xapi-to exit {result.returncode}: {result.stderr.strip()}")
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
                     continue
-                time.sleep(2 ** attempt)
-                continue
-            if e.code in (502, 503, 504) and attempt < retries - 1:
-                time.sleep(2 ** attempt)
-                continue
-            raise
-        except (urllib.error.URLError, TimeoutError) as e:
-            last_err = e
+                raise last_err
+            data = json.loads(result.stdout)
+            if not data.get("success", True):
+                err = data.get("error", {})
+                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                raise RuntimeError(f"xapi error: {msg}")
+            return data
+        except subprocess.TimeoutExpired:
+            last_err = RuntimeError("xapi-to call timed out (60s)")
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
                 continue
-            raise
-        except Exception as e:
-            last_err = e
-            raise
-    raise RuntimeError(f"unreachable: {last_err}")
+        except json.JSONDecodeError as e:
+            last_err = RuntimeError(f"xapi-to returned invalid JSON: {e}")
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+    raise last_err or RuntimeError("xapi_call failed")
 
 
 # ──────────────────────────────────────────────────────────────
-# Parsers
+# Parsers (xapi.to flat format)
 # ──────────────────────────────────────────────────────────────
-def parse_tweet_node(node: dict) -> dict | None:
-    """Extract flat tweet record from a Twitter241 nested 'result' node."""
-    if not node or node.get("__typename") not in ("Tweet", None):
-        return None
-    legacy = node.get("legacy") or {}
-    if not legacy:
-        return None
-
-    user_result = (
-        node.get("core", {}).get("user_results", {}).get("result", {}) or {}
-    )
-    user_legacy = user_result.get("legacy") or {}
-    user_core = user_result.get("core") or {}
-    screen_name = user_core.get("screen_name") or user_legacy.get("screen_name") or ""
-
-    views_count = 0
-    views = node.get("views") or {}
-    if views.get("count"):
-        try:
-            views_count = int(views["count"])
-        except (TypeError, ValueError):
-            views_count = 0
-
+def parse_xapi_tweet(t: dict) -> dict:
+    """Convert xapi.to tweet record to our internal flat format."""
+    user = t.get("user") or t.get("author") or {}
     return {
-        "tweet_id": str(node.get("rest_id") or legacy.get("id_str", "")),
-        "author_username": screen_name.lower(),
-        "author_followers": user_legacy.get("followers_count", 0),
-        "text": legacy.get("full_text", ""),
-        "created_at": legacy.get("created_at", ""),
-        "view_count": views_count,
-        "favorite_count": legacy.get("favorite_count", 0),
-        "retweet_count": legacy.get("retweet_count", 0),
-        "reply_count": legacy.get("reply_count", 0),
-        "quote_count": legacy.get("quote_count", 0),
-        "bookmark_count": legacy.get("bookmark_count", 0),
+        "tweet_id": str(t.get("tweet_id") or t.get("id") or ""),
+        "author_username": (user.get("screen_name") or t.get("screen_name") or "").lower(),
+        "author_followers": user.get("followers_count", 0),
+        "author_created_at": user.get("created_at", ""),
+        "text": t.get("text") or t.get("full_text") or "",
+        "created_at": t.get("created_at", ""),
+        "view_count": int(t.get("view_count") or t.get("views_count") or 0),
+        "favorite_count": int(t.get("favorite_count") or 0),
+        "retweet_count": int(t.get("retweet_count") or 0),
+        "reply_count": int(t.get("reply_count") or 0),
+        "quote_count": int(t.get("quote_count") or 0),
+        "bookmark_count": int(t.get("bookmark_count") or 0),
     }
 
 
-def _parse_item_content(item_content: dict, root_tid: str) -> dict | None:
-    """Parse a single TimelineTweet itemContent into a flat record."""
-    result = item_content.get("tweet_results", {}).get("result", {}) or {}
-    if result.get("__typename") == "TweetWithVisibilityResults":
-        result = result.get("tweet", {}) or {}
-    rec = parse_tweet_node(result)
-    if rec and rec.get("tweet_id") and rec["tweet_id"] != root_tid:
-        return rec
-    return None
-
-
-def extract_tweets_from_instructions(instructions: list, root_tid: str) -> tuple[list[dict], str | None]:
-    """Walk timeline instructions, return (tweet_records, next_cursor).
-
-    Handles three entry shapes:
-      - tweet-<id>             → standalone tweet (e.g. /quotes results)
-      - conversationthread-<id>→ TimelineTimelineModule with items[] (e.g. /comments results)
-      - cursor-bottom-...      → pagination
-    """
-    tweets = []
-    next_cursor = None
-    for inst in instructions or []:
-        for entry in inst.get("entries", []):
-            eid = entry.get("entryId", "")
-            content = entry.get("content", {}) or {}
-
-            if "cursor-bottom" in eid:
-                next_cursor = (
-                    content.get("value")
-                    or content.get("itemContent", {}).get("value")
-                )
-                continue
-            if "cursor" in eid:
-                continue
-
-            if eid.startswith("tweet-"):
-                # Standalone tweet entry
-                ic = content.get("itemContent", {})
-                rec = _parse_item_content(ic, root_tid)
-                if rec:
-                    tweets.append(rec)
-                continue
-
-            if eid.startswith("conversationthread-"):
-                # Module with multiple items (replier + sub-replies)
-                for item in content.get("items", []):
-                    item_inner = item.get("item", {}) or {}
-                    ic = item_inner.get("itemContent", {})
-                    if not ic:
-                        continue
-                    rec = _parse_item_content(ic, root_tid)
-                    if rec:
-                        tweets.append(rec)
-                continue
-
-    return tweets, next_cursor
+def parse_xapi_reply(t: dict) -> dict:
+    """Convert an xapi.to reply/quote item to our internal format."""
+    user = t.get("user") or t.get("author") or {}
+    return {
+        "tweet_id": str(t.get("tweet_id") or t.get("id") or ""),
+        "author_username": (user.get("screen_name") or "").lower(),
+        "author_followers": user.get("followers_count", 0),
+        "author_created_at": user.get("created_at", ""),
+        "text": t.get("text") or t.get("full_text") or "",
+        "created_at": t.get("created_at", ""),
+        "view_count": int(t.get("view_count") or t.get("views_count") or 0),
+        "favorite_count": int(t.get("favorite_count") or 0),
+        "retweet_count": int(t.get("retweet_count") or 0),
+        "reply_count": int(t.get("reply_count") or 0),
+        "quote_count": int(t.get("quote_count") or 0),
+    }
 
 
 def fetch_root_metrics() -> dict | None:
-    """Fetch the root tweet's current metrics."""
-    data = call_api(f"/tweet?pid={TWEET_ID}")
-    inst = (
-        data.get("data", {})
-        .get("threaded_conversation_with_injections_v2", {})
-        .get("instructions", [])
-    )
-    for i in inst:
-        for entry in i.get("entries", []):
-            eid = entry.get("entryId", "")
-            if eid == f"tweet-{TWEET_ID}":
-                content = entry.get("content", {}) or {}
-                result = (
-                    content.get("itemContent", {})
-                    .get("tweet_results", {})
-                    .get("result", {})
-                )
-                if result.get("__typename") == "TweetWithVisibilityResults":
-                    result = result.get("tweet", {})
-                return parse_tweet_node(result)
-    return None
+    """Fetch the root tweet's current metrics via xapi.to."""
+    try:
+        data = xapi_call("twitter.tweet_detail", {"tweet_id": TWEET_ID})
+    except Exception as e:
+        print(f"[{now_iso()}] WARN: tweet_detail failed: {e}", flush=True)
+        return None
+    tweet_data = data.get("data", {}).get("tweet") or data.get("data", {})
+    if not tweet_data:
+        return None
+    return parse_xapi_tweet(tweet_data)
 
 
-def fetch_replies_page(cursor: str = "") -> tuple[list[dict], str | None]:
-    """Fetch one page of replies. /comments returns result.instructions."""
-    path = f"/comments?pid={TWEET_ID}&count=20"
-    if cursor:
-        path += f"&cursor={urllib.parse.quote(cursor)}"
-    data = call_api(path)
-    inst = data.get("result", {}).get("instructions", [])
-    tweets, next_cursor = extract_tweets_from_instructions(inst, TWEET_ID)
-    return tweets, next_cursor
+def fetch_replies() -> list[dict]:
+    """Fetch replies from tweet_detail response."""
+    try:
+        data = xapi_call("twitter.tweet_detail", {"tweet_id": TWEET_ID})
+    except Exception as e:
+        print(f"[{now_iso()}] WARN: fetch_replies failed: {e}", flush=True)
+        return []
+    replies_raw = data.get("data", {}).get("replies") or []
+    return [parse_xapi_reply(r) for r in replies_raw if r]
 
 
-def fetch_quotes_page(cursor: str = "") -> tuple[list[dict], str | None]:
-    """Fetch one page of quotes. /quotes nests one level deeper: result.timeline.instructions."""
-    path = f"/quotes?pid={TWEET_ID}&count=20"
-    if cursor:
-        path += f"&cursor={urllib.parse.quote(cursor)}"
-    data = call_api(path)
-    inst = data.get("result", {}).get("timeline", {}).get("instructions", [])
-    tweets, next_cursor = extract_tweets_from_instructions(inst, TWEET_ID)
-    return tweets, next_cursor
+def fetch_quotes() -> list[dict]:
+    """Fetch quotes by searching for tweets that quote this one."""
+    try:
+        query = f"quoted_tweet_id:{TWEET_ID}"
+        data = xapi_call("twitter.search_timeline", {"raw_query": query, "count": 20})
+    except Exception as e:
+        print(f"[{now_iso()}] WARN: fetch_quotes failed: {e}", flush=True)
+        return []
+    tweets_raw = data.get("data", {}).get("tweets") or []
+    return [parse_xapi_reply(t) for t in tweets_raw if t.get("is_quote")]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -277,8 +215,6 @@ def load_state() -> dict:
         "last_metrics": None,
         "last_heat": 0.0,
         "last_ts": None,
-        "replies_cursor": "",
-        "quotes_cursor": "",
         "seen_reply_ids": [],
         "seen_quote_ids": [],
         "cycle_count": 0,
@@ -321,14 +257,158 @@ def append_jsonl(path: Path, record: dict) -> None:
         f.write(json.dumps(record) + "\n")
 
 
-def compute_heat(m: dict) -> float:
-    return (
-        W_VIEWS * m["view_count"]
-        + W_LIKES * m["favorite_count"]
-        + W_RTS * m["retweet_count"]
-        + W_REPLIES * m["reply_count"]
-        + W_QUOTES * m["quote_count"]
-    )
+def load_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    out = []
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def quality_multiplier(followers: int, account_created_at: str = "") -> float:
+    """Layer 2: compute quality multiplier from follower count and account age."""
+    q = 1.0
+    for threshold, mult in QUALITY_TIERS:
+        if followers >= threshold:
+            q = mult
+            break
+    # New account penalty
+    if account_created_at:
+        try:
+            created = datetime.strptime(account_created_at, "%a %b %d %H:%M:%S %z %Y")
+            age_days = (datetime.now(timezone.utc) - created).days
+            if age_days < QUALITY_NEW_ACCOUNT_DAYS:
+                q *= QUALITY_NEW_ACCOUNT_MULTIPLIER
+        except (ValueError, TypeError):
+            pass
+    return q
+
+
+def temporal_decay(post_created_at: str, action_time: str) -> float:
+    """Layer 3: compute temporal decay based on hours since post creation."""
+    try:
+        t_post = datetime.strptime(post_created_at, "%a %b %d %H:%M:%S %z %Y")
+        t_action = datetime.fromisoformat(action_time)
+        delta_hours = max(0, (t_action - t_post).total_seconds() / 3600)
+    except (ValueError, TypeError):
+        return 1.0
+    for max_hours, mult in TEMPORAL_DECAY:
+        if max_hours is None or delta_hours <= max_hours:
+            return mult
+    return 0.05
+
+
+def quote_base_weight(text: str) -> float:
+    """Determine base weight for a quote: standard or with commentary."""
+    if len(text or "") > COMMENTARY_MIN_CHARS:
+        return W_QUOTES_WITH_COMMENTARY
+    return W_QUOTES
+
+
+def compute_interaction_bonus(replies: list, quotes: list, post_created_at: str) -> float:
+    """Layer 4: cross-signal interaction bonuses."""
+    bonus = 0.0
+
+    reply_authors = {r.get("author_username", "") for r in replies if r.get("author_username")}
+    quote_authors = {q.get("author_username", "") for q in quotes if q.get("author_username")}
+
+    # Bonus: same user quote + reply
+    overlap = reply_authors & quote_authors
+    bonus += len(overlap) * BONUS_QUOTE_AND_REPLY
+
+    # Bonus: burst quotes (≥3 independent quotes within 10min window)
+    quote_times = []
+    for q in quotes:
+        try:
+            qt = datetime.strptime(q.get("created_at", ""), "%a %b %d %H:%M:%S %z %Y")
+            quote_times.append(qt)
+        except (ValueError, TypeError):
+            continue
+    quote_times.sort()
+    for i in range(len(quote_times) - 2):
+        window = (quote_times[i + 2] - quote_times[i]).total_seconds()
+        if window <= 600:  # 10 minutes
+            bonus += BONUS_BURST_QUOTES
+            break  # count once per cycle
+
+    return bonus
+
+
+def compute_heat_v2(
+    metrics: dict,
+    replies: list,
+    quotes: list,
+    post_created_at: str = "",
+) -> dict:
+    """XHI v2 multi-layer heat scoring.
+
+    Returns dict with heat_raw, component breakdown, and bonus.
+    """
+    # Views baseline (no quality multiplier, no decay for aggregate count)
+    views_score = W_VIEWS * metrics["view_count"]
+
+    # Likes baseline (aggregate — no per-user data available)
+    likes_score = W_LIKES * metrics["favorite_count"]
+
+    # RTs baseline (aggregate — no per-user data available)
+    rts_score = W_RTS * metrics["retweet_count"]
+
+    # Per-reply scoring with quality + decay
+    replies_score = 0.0
+    for r in replies:
+        w = W_REPLIES
+        q = quality_multiplier(
+            int(r.get("author_followers", 0) or 0),
+            r.get("author_created_at", "") or r.get("created_at", ""),
+        )
+        d = temporal_decay(post_created_at, r.get("fetched_at", ""))
+        replies_score += w * q * d
+
+    # Fallback: if aggregate reply_count > len(replies), add remainder at base weight
+    tracked_reply_count = len(replies)
+    untracked_replies = max(0, metrics["reply_count"] - tracked_reply_count)
+    replies_score += untracked_replies * W_REPLIES
+
+    # Per-quote scoring with quality + decay + commentary detection
+    quotes_score = 0.0
+    for q in quotes:
+        w = quote_base_weight(q.get("text", ""))
+        qm = quality_multiplier(
+            int(q.get("author_followers", 0) or 0),
+            q.get("author_created_at", "") or q.get("created_at", ""),
+        )
+        d = temporal_decay(post_created_at, q.get("fetched_at", ""))
+        quotes_score += w * qm * d
+
+    # Fallback for untracked quotes
+    tracked_quote_count = len(quotes)
+    untracked_quotes = max(0, metrics["quote_count"] - tracked_quote_count)
+    quotes_score += untracked_quotes * W_QUOTES
+
+    # Layer 4: interaction bonus
+    bonus = compute_interaction_bonus(replies, quotes, post_created_at)
+
+    heat_raw = views_score + likes_score + rts_score + replies_score + quotes_score + bonus
+
+    return {
+        "heat_raw": heat_raw,
+        "components": {
+            "views": round(views_score, 2),
+            "likes": round(likes_score, 2),
+            "rts": round(rts_score, 2),
+            "replies": round(replies_score, 2),
+            "quotes": round(quotes_score, 2),
+            "bonus": round(bonus, 2),
+        },
+    }
 
 
 def compute_engagement_rate(m: dict) -> float:
@@ -350,8 +430,9 @@ def is_promoted(handle: str, cfg: dict) -> bool:
 def render_dashboard(metrics: dict, derived: dict, state: dict, cfg: dict, new_replies: int, new_quotes: int) -> str:
     lines = []
     lines.append("═" * 60)
-    lines.append(f" Tweet Tracker — {TWEET_ID}")
+    lines.append(f" XHI Tweet Tracker — {TWEET_ID}")
     lines.append(f" Updated: {derived['ts']}")
+    lines.append(f" API: xapi.to")
     lines.append("═" * 60)
     lines.append("")
     lines.append(f" Author:        @{metrics.get('author_username', '?')} ({metrics.get('author_followers', 0):,} followers)")
@@ -369,11 +450,21 @@ def render_dashboard(metrics: dict, derived: dict, state: dict, cfg: dict, new_r
     lines.append(f"  bookmarks: {metrics['bookmark_count']:>12,}")
     lines.append("")
     lines.append("─" * 60)
-    lines.append(" Derived")
+    lines.append(" Derived (XHI v2)")
     lines.append("─" * 60)
     lines.append(f"  Heat Score:        {derived['heat_score']:>12,.0f}")
     lines.append(f"  Heat Velocity:     {derived['heat_velocity_per_min']:>12,.1f}  per minute")
     lines.append(f"  Engagement Rate:   {derived['engagement_rate']:>12,.2%}")
+    components = derived.get("heat_components", {})
+    if components:
+        lines.append("")
+        lines.append("  Score breakdown:")
+        lines.append(f"    views:   {components.get('views', 0):>10,.1f}")
+        lines.append(f"    likes:   {components.get('likes', 0):>10,.1f}")
+        lines.append(f"    RTs:     {components.get('rts', 0):>10,.1f}")
+        lines.append(f"    replies: {components.get('replies', 0):>10,.1f}")
+        lines.append(f"    quotes:  {components.get('quotes', 0):>10,.1f}")
+        lines.append(f"    bonus:   {components.get('bonus', 0):>10,.1f}")
     lines.append("")
     lines.append("─" * 60)
     lines.append(" Promotion config")
@@ -413,67 +504,51 @@ def cycle(state: dict, cfg: dict) -> None:
     metrics["ts"] = ts
     append_jsonl(METRICS_FILE, metrics)
 
-    # Fetch new replies (paginated, capped at MAX_PAGES per cycle)
+    # Fetch replies (from tweet_detail response)
     seen_replies = set(state["seen_reply_ids"])
     new_replies = 0
-    cursor = state.get("replies_cursor", "") or ""
-    for page in range(MAX_PAGES):
-        try:
-            tweets, next_cursor = fetch_replies_page(cursor)
-        except Exception as e:
-            print(f"[{ts}] WARN: replies fetch failed page={page}: {e}", flush=True)
-            break
-        if not tweets:
-            break
-        any_new = False
-        for t in tweets:
-            tid = t["tweet_id"]
-            if not tid or tid in seen_replies:
-                continue
-            seen_replies.add(tid)
-            t["fetched_at"] = ts
-            t["is_promoted_kol"] = is_promoted(t.get("author_username", ""), cfg)
-            append_jsonl(REPLIES_FILE, t)
-            new_replies += 1
-            any_new = True
-        if not any_new or not next_cursor:
-            break
-        cursor = next_cursor
-    # Save the latest cursor for next cycle
-    state["replies_cursor"] = cursor
+    try:
+        reply_list = fetch_replies()
+    except Exception as e:
+        print(f"[{ts}] WARN: replies fetch failed: {e}", flush=True)
+        reply_list = []
+    for t in reply_list:
+        tid = t["tweet_id"]
+        if not tid or tid in seen_replies:
+            continue
+        seen_replies.add(tid)
+        t["fetched_at"] = ts
+        t["is_promoted_kol"] = is_promoted(t.get("author_username", ""), cfg)
+        append_jsonl(REPLIES_FILE, t)
+        new_replies += 1
     state["seen_reply_ids"] = list(seen_replies)
 
-    # Fetch new quotes
+    # Fetch quotes (via search)
     seen_quotes = set(state["seen_quote_ids"])
     new_quotes = 0
-    cursor = state.get("quotes_cursor", "") or ""
-    for page in range(MAX_PAGES):
-        try:
-            tweets, next_cursor = fetch_quotes_page(cursor)
-        except Exception as e:
-            print(f"[{ts}] WARN: quotes fetch failed page={page}: {e}", flush=True)
-            break
-        if not tweets:
-            break
-        any_new = False
-        for t in tweets:
-            tid = t["tweet_id"]
-            if not tid or tid in seen_quotes:
-                continue
-            seen_quotes.add(tid)
-            t["fetched_at"] = ts
-            t["is_promoted_kol"] = is_promoted(t.get("author_username", ""), cfg)
-            append_jsonl(QUOTES_FILE, t)
-            new_quotes += 1
-            any_new = True
-        if not any_new or not next_cursor:
-            break
-        cursor = next_cursor
-    state["quotes_cursor"] = cursor
+    try:
+        quote_list = fetch_quotes()
+    except Exception as e:
+        print(f"[{ts}] WARN: quotes fetch failed: {e}", flush=True)
+        quote_list = []
+    for t in quote_list:
+        tid = t["tweet_id"]
+        if not tid or tid in seen_quotes:
+            continue
+        seen_quotes.add(tid)
+        t["fetched_at"] = ts
+        t["is_promoted_kol"] = is_promoted(t.get("author_username", ""), cfg)
+        append_jsonl(QUOTES_FILE, t)
+        new_quotes += 1
     state["seen_quote_ids"] = list(seen_quotes)
 
-    # Compute derived metrics
-    heat = compute_heat(metrics)
+    # Compute derived metrics (XHI v2: multi-layer scoring)
+    all_replies = load_jsonl(REPLIES_FILE)
+    all_quotes = load_jsonl(QUOTES_FILE)
+    post_created_at = metrics.get("created_at", "")
+
+    heat_result = compute_heat_v2(metrics, all_replies, all_quotes, post_created_at)
+    heat = heat_result["heat_raw"]
     velocity = 0.0
     if state.get("last_heat") and state.get("last_ts"):
         last_ts_dt = datetime.fromisoformat(state["last_ts"])
@@ -487,6 +562,7 @@ def cycle(state: dict, cfg: dict) -> None:
         "heat_score": heat,
         "heat_velocity_per_min": velocity,
         "engagement_rate": compute_engagement_rate(metrics),
+        "heat_components": heat_result["components"],
         "view_count": metrics["view_count"],
         "favorite_count": metrics["favorite_count"],
         "retweet_count": metrics["retweet_count"],
@@ -517,10 +593,11 @@ def cycle(state: dict, cfg: dict) -> None:
 
 
 def main():
-    print(f"=== Tweet Tracker started ===", flush=True)
+    print(f"=== XHI Tweet Tracker started ===", flush=True)
     print(f"  TWEET_ID:  {TWEET_ID}", flush=True)
     print(f"  DATA_DIR:  {TWEET_DIR}", flush=True)
     print(f"  INTERVAL:  {INTERVAL}s", flush=True)
+    print(f"  API:       xapi.to", flush=True)
 
     state = load_state()
     cfg = load_config()
