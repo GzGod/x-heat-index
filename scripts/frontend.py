@@ -37,6 +37,7 @@ HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>x-heat-index · 传播实时监控</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
 <style>
   :root {
     --bg: #0d1117;
@@ -488,33 +489,7 @@ Chart.defaults.borderColor = "#30363d";
 Chart.defaults.font.family = "-apple-system, BlinkMacSystemFont, PingFang SC, Segoe UI, sans-serif";
 Chart.defaults.font.size = 11;
 
-// Minimal time adapter
-const _adapter = {
-  formats: () => ({ datetime: "MM-dd HH:mm", hour: "HH:mm", day: "MM-dd", month: "yyyy-MM", year: "yyyy" }),
-  parse: (v) => typeof v === "number" ? v : new Date(v).valueOf(),
-  format: (v, fmt) => {
-    const d = new Date(v);
-    const pad = (n) => String(n).padStart(2, "0");
-    if (fmt === "HH:mm") return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-    if (fmt === "MM-dd") return `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-    if (fmt === "MM-dd HH:mm") return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-    if (fmt === "yyyy-MM") return `${d.getFullYear()}-${pad(d.getMonth() + 1)}`;
-    if (fmt === "yyyy") return String(d.getFullYear());
-    return d.toISOString();
-  },
-  add: (v, amt, unit) => {
-    const d = new Date(v);
-    const map = { millisecond: 1, second: 1000, minute: 60000, hour: 3600000, day: 86400000 };
-    return d.valueOf() + amt * (map[unit] || 0);
-  },
-  diff: (a, b, unit) => {
-    const map = { millisecond: 1, second: 1000, minute: 60000, hour: 3600000, day: 86400000 };
-    return (new Date(a).valueOf() - new Date(b).valueOf()) / (map[unit] || 1);
-  },
-  startOf: (v) => new Date(v).valueOf(),
-  endOf: (v) => new Date(v).valueOf(),
-};
-Chart._adapters._date.override(_adapter);
+// Date adapter loaded from CDN (chartjs-adapter-date-fns)
 
 let charts = {};
 function makeLineChart(canvasId, datasets, opts = {}) {
