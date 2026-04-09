@@ -472,6 +472,10 @@ def main():
         return
 
     state = load_state()
+    # Wait for Phase 1 to complete at least one cycle before first walk
+    if state["cycle_count"] == 0:
+        print("  Waiting 90s for Phase 1 to collect initial data...", flush=True)
+        time.sleep(90)
     while True:
         try:
             cycle(state)
