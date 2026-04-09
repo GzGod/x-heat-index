@@ -132,7 +132,11 @@ def xapi_call(action: str, params: dict, retries: int = 3) -> dict:
 # Parsers (xapi.to flat format)
 # ──────────────────────────────────────────────────────────────
 def parse_xapi_tweet(t: dict) -> dict:
-    """Convert xapi.to tweet record to our internal flat format."""
+    """Convert xapi.to tweet record to our internal flat format.
+
+    Handles both search_timeline format (user field) and
+    tweet_detail format (author field, id instead of tweet_id).
+    """
     user = t.get("user") or t.get("author") or {}
     return {
         "tweet_id": str(t.get("tweet_id") or t.get("id") or ""),
@@ -151,7 +155,11 @@ def parse_xapi_tweet(t: dict) -> dict:
 
 
 def parse_xapi_reply(t: dict) -> dict:
-    """Convert an xapi.to reply/quote item to our internal format."""
+    """Convert an xapi.to reply/quote item to our internal format.
+
+    tweet_detail replies use: id, author, full_text, is_quote_status, in_reply_to_status_id
+    search_timeline uses: tweet_id, user, text, is_quote, is_reply
+    """
     user = t.get("user") or t.get("author") or {}
     return {
         "tweet_id": str(t.get("tweet_id") or t.get("id") or ""),
@@ -165,15 +173,23 @@ def parse_xapi_reply(t: dict) -> dict:
         "retweet_count": int(t.get("retweet_count") or 0),
         "reply_count": int(t.get("reply_count") or 0),
         "quote_count": int(t.get("quote_count") or 0),
+        "is_quote": bool(t.get("is_quote") or t.get("is_quote_status")),
     }
+
+
+def _fetch_tweet_detail() -> dict | None:
+    """Fetch tweet_detail once (used by metrics, replies, and quotes)."""
+    try:
+        return xapi_call("twitter.tweet_detail", {"tweet_id": TWEET_ID})
+    except Exception as e:
+        print(f"[{now_iso()}] WARN: tweet_detail failed: {e}", flush=True)
+        return None
 
 
 def fetch_root_metrics() -> dict | None:
     """Fetch the root tweet's current metrics via xapi.to."""
-    try:
-        data = xapi_call("twitter.tweet_detail", {"tweet_id": TWEET_ID})
-    except Exception as e:
-        print(f"[{now_iso()}] WARN: tweet_detail failed: {e}", flush=True)
+    data = _fetch_tweet_detail()
+    if not data:
         return None
     tweet_data = data.get("data", {}).get("tweet") or data.get("data", {})
     if not tweet_data:
@@ -181,27 +197,25 @@ def fetch_root_metrics() -> dict | None:
     return parse_xapi_tweet(tweet_data)
 
 
-def fetch_replies() -> list[dict]:
-    """Fetch replies from tweet_detail response."""
-    try:
-        data = xapi_call("twitter.tweet_detail", {"tweet_id": TWEET_ID})
-    except Exception as e:
-        print(f"[{now_iso()}] WARN: fetch_replies failed: {e}", flush=True)
-        return []
-    replies_raw = data.get("data", {}).get("replies") or []
-    return [parse_xapi_reply(r) for r in replies_raw if r]
+def fetch_replies_and_quotes(detail_data: dict | None) -> tuple[list[dict], list[dict]]:
+    """Extract replies and quotes from tweet_detail response.
 
-
-def fetch_quotes() -> list[dict]:
-    """Fetch quotes by searching for tweets that quote this one."""
-    try:
-        query = f"quoted_tweet_id:{TWEET_ID}"
-        data = xapi_call("twitter.search_timeline", {"raw_query": query, "count": 20})
-    except Exception as e:
-        print(f"[{now_iso()}] WARN: fetch_quotes failed: {e}", flush=True)
-        return []
-    tweets_raw = data.get("data", {}).get("tweets") or []
-    return [parse_xapi_reply(t) for t in tweets_raw if t.get("is_quote")]
+    Returns (replies, quotes) split by is_quote_status field.
+    """
+    if not detail_data:
+        return [], []
+    all_items = detail_data.get("data", {}).get("replies") or []
+    replies = []
+    quotes = []
+    for item in all_items:
+        rec = parse_xapi_reply(item)
+        if not rec["tweet_id"]:
+            continue
+        if rec["is_quote"]:
+            quotes.append(rec)
+        else:
+            replies.append(rec)
+    return replies, quotes
 
 
 # ──────────────────────────────────────────────────────────────
@@ -496,22 +510,25 @@ def cycle(state: dict, cfg: dict) -> None:
     ts = now_iso()
     state["cycle_count"] += 1
 
-    # Fetch root metrics
-    metrics = fetch_root_metrics()
-    if not metrics:
-        print(f"[{ts}] WARN: failed to fetch root metrics, skipping cycle", flush=True)
+    # Fetch tweet detail (one API call for metrics + replies + quotes)
+    detail_data = _fetch_tweet_detail()
+    if not detail_data:
+        print(f"[{ts}] WARN: failed to fetch tweet detail, skipping cycle", flush=True)
         return
+    tweet_data = detail_data.get("data", {}).get("tweet") or detail_data.get("data", {})
+    if not tweet_data:
+        print(f"[{ts}] WARN: no tweet data in response, skipping cycle", flush=True)
+        return
+    metrics = parse_xapi_tweet(tweet_data)
     metrics["ts"] = ts
     append_jsonl(METRICS_FILE, metrics)
 
-    # Fetch replies (from tweet_detail response)
+    # Split replies and quotes from the same response
+    reply_list, quote_list = fetch_replies_and_quotes(detail_data)
+
+    # Process replies
     seen_replies = set(state["seen_reply_ids"])
     new_replies = 0
-    try:
-        reply_list = fetch_replies()
-    except Exception as e:
-        print(f"[{ts}] WARN: replies fetch failed: {e}", flush=True)
-        reply_list = []
     for t in reply_list:
         tid = t["tweet_id"]
         if not tid or tid in seen_replies:
@@ -523,14 +540,9 @@ def cycle(state: dict, cfg: dict) -> None:
         new_replies += 1
     state["seen_reply_ids"] = list(seen_replies)
 
-    # Fetch quotes (via search)
+    # Process quotes (from same tweet_detail response)
     seen_quotes = set(state["seen_quote_ids"])
     new_quotes = 0
-    try:
-        quote_list = fetch_quotes()
-    except Exception as e:
-        print(f"[{ts}] WARN: quotes fetch failed: {e}", flush=True)
-        quote_list = []
     for t in quote_list:
         tid = t["tweet_id"]
         if not tid or tid in seen_quotes:

@@ -101,7 +101,11 @@ def xapi_call(action: str, params: dict, retries: int = 3) -> dict:
 # Parsers (xapi.to flat format)
 # ──────────────────────────────────────────────────────────────
 def parse_xapi_reply(t: dict) -> dict | None:
-    """Convert xapi.to reply/quote item to our internal format."""
+    """Convert xapi.to reply/quote item to our internal format.
+
+    tweet_detail replies use: id, author, full_text, is_quote_status
+    search_timeline uses: tweet_id, user, text, is_quote
+    """
     user = t.get("user") or t.get("author") or {}
     tid = str(t.get("tweet_id") or t.get("id") or "")
     if not tid:
@@ -118,41 +122,31 @@ def parse_xapi_reply(t: dict) -> dict | None:
         "retweet_count": int(t.get("retweet_count") or 0),
         "reply_count": int(t.get("reply_count") or 0),
         "quote_count": int(t.get("quote_count") or 0),
+        "is_quote": bool(t.get("is_quote") or t.get("is_quote_status")),
     }
 
 
-def fetch_sub_replies(parent_tid: str) -> list[dict]:
-    """Fetch replies to a parent tweet via tweet_detail."""
+def fetch_sub_replies(parent_tid: str) -> tuple[list[dict], list[dict]]:
+    """Fetch sub-replies and sub-quotes of a parent tweet via tweet_detail.
+
+    Returns (replies, quotes) split by is_quote_status.
+    """
     try:
         data = xapi_call("twitter.tweet_detail", {"tweet_id": parent_tid})
     except Exception as e:
         print(f"[{now_iso()}] WARN: fetch_sub_replies({parent_tid}) failed: {e}", flush=True)
-        return []
-    replies_raw = data.get("data", {}).get("replies") or []
-    out = []
-    for r in replies_raw:
-        rec = parse_xapi_reply(r)
+        return [], []
+    all_items = data.get("data", {}).get("replies") or []
+    replies = []
+    quotes = []
+    for item in all_items:
+        rec = parse_xapi_reply(item)
         if rec and rec["tweet_id"] != parent_tid:
-            out.append(rec)
-    return out
-
-
-def fetch_sub_quotes(parent_tid: str) -> list[dict]:
-    """Fetch quotes of a parent tweet via search."""
-    try:
-        query = f"quoted_tweet_id:{parent_tid}"
-        data = xapi_call("twitter.search_timeline", {"raw_query": query, "count": 20})
-    except Exception as e:
-        print(f"[{now_iso()}] WARN: fetch_sub_quotes({parent_tid}) failed: {e}", flush=True)
-        return []
-    tweets_raw = data.get("data", {}).get("tweets") or []
-    out = []
-    for t in tweets_raw:
-        if t.get("is_quote"):
-            rec = parse_xapi_reply(t)
-            if rec and rec["tweet_id"] != parent_tid:
-                out.append(rec)
-    return out
+            if rec.get("is_quote"):
+                quotes.append(rec)
+            else:
+                replies.append(rec)
+    return replies, quotes
 
 
 # ──────────────────────────────────────────────────────────────
@@ -366,12 +360,13 @@ def cycle(state: dict) -> None:
         parent_tid = parent_rec["tweet_id"]
         parent_handle = parent_rec.get("author_username", "")
 
-        # Sub-replies
+        # Sub-replies and sub-quotes from one API call
         try:
-            sub_replies = fetch_sub_replies(parent_tid)
+            sub_replies, sub_quotes = fetch_sub_replies(parent_tid)
         except Exception as e:
-            print(f"  [{idx}/{len(new_to_walk)}] WARN: sub_replies({parent_tid}) {e}", flush=True)
-            sub_replies = []
+            print(f"  [{idx}/{len(new_to_walk)}] WARN: fetch({parent_tid}) {e}", flush=True)
+            sub_replies, sub_quotes = [], []
+
         for sn in sub_replies:
             tid = sn.get("tweet_id")
             if not tid or tid in seen_sub:
@@ -394,12 +389,7 @@ def cycle(state: dict) -> None:
             })
             new_sub_nodes_count += 1
 
-        # Sub-quotes
-        try:
-            sub_quotes = fetch_sub_quotes(parent_tid)
-        except Exception as e:
-            print(f"  [{idx}/{len(new_to_walk)}] WARN: sub_quotes({parent_tid}) {e}", flush=True)
-            sub_quotes = []
+        # Sub-quotes (already fetched above)
         for sn in sub_quotes:
             tid = sn.get("tweet_id")
             if not tid or tid in seen_sub:
