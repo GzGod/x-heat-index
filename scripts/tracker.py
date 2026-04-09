@@ -129,93 +129,153 @@ def xapi_call(action: str, params: dict, retries: int = 3) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────
-# Parsers (xapi.to flat format)
+# Parsers (xapi.to sapi_* format — flat, with user object)
 # ──────────────────────────────────────────────────────────────
-def parse_xapi_tweet(t: dict) -> dict:
-    """Convert xapi.to tweet record to our internal flat format.
-
-    Handles both search_timeline format (user field) and
-    tweet_detail format (author field, id instead of tweet_id).
-    """
-    user = t.get("user") or t.get("author") or {}
+def parse_sapi_tweet(t: dict) -> dict:
+    """Convert sapi_TweetDetail tweet to our internal flat format."""
+    user = t.get("user") or {}
     return {
-        "tweet_id": str(t.get("tweet_id") or t.get("id") or ""),
-        "author_username": (user.get("screen_name") or t.get("screen_name") or "").lower(),
-        "author_followers": user.get("followers_count", 0),
+        "tweet_id": str(t.get("tweet_id") or ""),
+        "author_username": (user.get("screen_name") or "").lower(),
+        "author_followers": int(user.get("followers_count", 0) or 0),
         "author_created_at": user.get("created_at", ""),
-        "text": t.get("text") or t.get("full_text") or "",
+        "text": t.get("text") or "",
         "created_at": t.get("created_at", ""),
-        "view_count": int(t.get("view_count") or t.get("views_count") or 0),
+        "view_count": int(t.get("view_count") or 0),
         "favorite_count": int(t.get("favorite_count") or 0),
         "retweet_count": int(t.get("retweet_count") or 0),
         "reply_count": int(t.get("reply_count") or 0),
         "quote_count": int(t.get("quote_count") or 0),
         "bookmark_count": int(t.get("bookmark_count") or 0),
+        "is_reply": bool(t.get("is_reply")),
+        "is_quote": bool(t.get("is_quote")),
     }
 
 
-def parse_xapi_reply(t: dict) -> dict:
-    """Convert an xapi.to reply/quote item to our internal format.
-
-    tweet_detail replies use: id, author, full_text, is_quote_status, in_reply_to_status_id
-    search_timeline uses: tweet_id, user, text, is_quote, is_reply
-    """
-    user = t.get("user") or t.get("author") or {}
+def parse_graphql_retweeter(entry: dict) -> dict | None:
+    """Parse a graphql Retweeters entry into {username, followers_count}."""
+    result = (entry.get("content", {})
+              .get("itemContent", {})
+              .get("user_results", {})
+              .get("result", {}))
+    if not result or result.get("__typename") != "User":
+        return None
+    legacy = result.get("legacy") or {}
     return {
-        "tweet_id": str(t.get("tweet_id") or t.get("id") or ""),
-        "author_username": (user.get("screen_name") or "").lower(),
-        "author_followers": user.get("followers_count", 0),
-        "author_created_at": user.get("created_at", ""),
-        "text": t.get("text") or t.get("full_text") or "",
-        "created_at": t.get("created_at", ""),
-        "view_count": int(t.get("view_count") or t.get("views_count") or 0),
-        "favorite_count": int(t.get("favorite_count") or 0),
-        "retweet_count": int(t.get("retweet_count") or 0),
-        "reply_count": int(t.get("reply_count") or 0),
-        "quote_count": int(t.get("quote_count") or 0),
-        "is_quote": bool(t.get("is_quote") or t.get("is_quote_status")),
+        "username": (legacy.get("screen_name") or "").lower(),
+        "followers_count": int(legacy.get("followers_count", 0) or 0),
+        "created_at": legacy.get("created_at", ""),
     }
 
 
-def _fetch_tweet_detail() -> dict | None:
-    """Fetch tweet_detail once (used by metrics, replies, and quotes)."""
-    try:
-        return xapi_call("twitter.tweet_detail", {"tweet_id": TWEET_ID})
-    except Exception as e:
-        print(f"[{now_iso()}] WARN: tweet_detail failed: {e}", flush=True)
-        return None
+def fetch_tweet_detail_paged() -> tuple[dict | None, list[dict]]:
+    """Fetch root tweet + all replies via sapi_TweetDetail with cursor pagination.
 
-
-def fetch_root_metrics() -> dict | None:
-    """Fetch the root tweet's current metrics via xapi.to."""
-    data = _fetch_tweet_detail()
-    if not data:
-        return None
-    tweet_data = data.get("data", {}).get("tweet") or data.get("data", {})
-    if not tweet_data:
-        return None
-    return parse_xapi_tweet(tweet_data)
-
-
-def fetch_replies_and_quotes(detail_data: dict | None) -> tuple[list[dict], list[dict]]:
-    """Extract replies and quotes from tweet_detail response.
-
-    Returns (replies, quotes) split by is_quote_status field.
+    Returns (root_metrics, all_reply_records).
     """
-    if not detail_data:
-        return [], []
-    all_items = detail_data.get("data", {}).get("replies") or []
-    replies = []
-    quotes = []
-    for item in all_items:
-        rec = parse_xapi_reply(item)
-        if not rec["tweet_id"]:
-            continue
-        if rec["is_quote"]:
-            quotes.append(rec)
-        else:
-            replies.append(rec)
-    return replies, quotes
+    root = None
+    all_replies = []
+    cursor = ""
+    max_pages = 5
+
+    for page in range(max_pages):
+        params = {"tweet_id": TWEET_ID}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            data = xapi_call("twitter.sapi_TweetDetail", {"params": params})
+        except Exception as e:
+            print(f"[{now_iso()}] WARN: sapi_TweetDetail page={page} failed: {e}", flush=True)
+            break
+
+        resp = data.get("data", {})
+        tweets = resp.get("tweets") or []
+
+        for t in tweets:
+            tid = str(t.get("tweet_id") or "")
+            if tid == TWEET_ID and root is None:
+                root = parse_sapi_tweet(t)
+            elif tid and tid != TWEET_ID:
+                all_replies.append(parse_sapi_tweet(t))
+
+        cursor = resp.get("next_cursor_str") or ""
+        if not cursor:
+            break
+
+    return root, all_replies
+
+
+def fetch_quotes_paged() -> list[dict]:
+    """Fetch all quotes via sapi_Quotes with cursor pagination."""
+    all_quotes = []
+    cursor = ""
+    max_pages = 5
+
+    for page in range(max_pages):
+        params = {"tweet_id": TWEET_ID}
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            data = xapi_call("twitter.sapi_Quotes", {"params": params})
+        except Exception as e:
+            print(f"[{now_iso()}] WARN: sapi_Quotes page={page} failed: {e}", flush=True)
+            break
+
+        resp = data.get("data", {})
+        tweets = resp.get("tweets") or []
+
+        for t in tweets:
+            rec = parse_sapi_tweet(t)
+            if rec["tweet_id"] and rec["tweet_id"] != TWEET_ID:
+                rec["is_quote"] = True  # force flag since these are all quotes
+                all_quotes.append(rec)
+
+        cursor = resp.get("next_cursor_str") or ""
+        if not cursor:
+            break
+
+    return all_quotes
+
+
+def fetch_retweeters() -> list[dict]:
+    """Fetch retweeter user profiles via graphql_Retweeters."""
+    all_retweeters = []
+    cursor = ""
+    max_pages = 3
+
+    for page in range(max_pages):
+        variables = {"tweetId": TWEET_ID, "count": 100, "includePromotedContent": False}
+        if cursor:
+            variables["cursor"] = cursor
+        try:
+            data = xapi_call("twitter.graphql_Retweeters", {
+                "params": {"variables": json.dumps(variables)}
+            })
+        except Exception as e:
+            print(f"[{now_iso()}] WARN: graphql_Retweeters page={page} failed: {e}", flush=True)
+            break
+
+        resp = data.get("data", {}).get("data", {})
+        instructions = (resp.get("retweeters_timeline", {})
+                        .get("timeline", {})
+                        .get("instructions", []))
+
+        found_cursor = ""
+        for inst in instructions:
+            for entry in inst.get("entries", []):
+                eid = entry.get("entryId", "")
+                if "cursor-bottom" in eid:
+                    found_cursor = (entry.get("content", {}).get("value") or "")
+                    continue
+                user = parse_graphql_retweeter(entry)
+                if user:
+                    all_retweeters.append(user)
+
+        cursor = found_cursor
+        if not cursor:
+            break
+
+    return all_retweeters
 
 
 # ──────────────────────────────────────────────────────────────
@@ -510,21 +570,33 @@ def cycle(state: dict, cfg: dict) -> None:
     ts = now_iso()
     state["cycle_count"] += 1
 
-    # Fetch tweet detail (one API call for metrics + replies + quotes)
-    detail_data = _fetch_tweet_detail()
-    if not detail_data:
+    # Fetch tweet detail with pagination (metrics + replies)
+    metrics, reply_list = fetch_tweet_detail_paged()
+    if not metrics:
         print(f"[{ts}] WARN: failed to fetch tweet detail, skipping cycle", flush=True)
         return
-    tweet_data = detail_data.get("data", {}).get("tweet") or detail_data.get("data", {})
-    if not tweet_data:
-        print(f"[{ts}] WARN: no tweet data in response, skipping cycle", flush=True)
-        return
-    metrics = parse_xapi_tweet(tweet_data)
     metrics["ts"] = ts
     append_jsonl(METRICS_FILE, metrics)
 
-    # Split replies and quotes from the same response
-    reply_list, quote_list = fetch_replies_and_quotes(detail_data)
+    # Fetch quotes (separate endpoint with pagination)
+    quote_list = fetch_quotes_paged()
+
+    # Fetch retweeters (user profiles with follower counts)
+    retweeter_list = fetch_retweeters()
+    if retweeter_list:
+        # Save retweeters to a dedicated file for reach calculation
+        retweeters_file = TWEET_DIR / "retweeters.jsonl"
+        seen_rt = set()
+        if retweeters_file.exists():
+            for line in retweeters_file.read_text().splitlines():
+                try:
+                    seen_rt.add(json.loads(line).get("username", ""))
+                except json.JSONDecodeError:
+                    pass
+        for rt in retweeter_list:
+            if rt["username"] and rt["username"] not in seen_rt:
+                seen_rt.add(rt["username"])
+                append_jsonl(retweeters_file, {**rt, "fetched_at": ts})
 
     # Process replies
     seen_replies = set(state["seen_reply_ids"])
@@ -540,7 +612,7 @@ def cycle(state: dict, cfg: dict) -> None:
         new_replies += 1
     state["seen_reply_ids"] = list(seen_replies)
 
-    # Process quotes (from same tweet_detail response)
+    # Process quotes (from sapi_Quotes endpoint)
     seen_quotes = set(state["seen_quote_ids"])
     new_quotes = 0
     for t in quote_list:
@@ -599,7 +671,8 @@ def cycle(state: dict, cfg: dict) -> None:
     print(
         f"[{ts}] cycle #{state['cycle_count']}: heat={heat:.0f} velocity={velocity:.1f}/min "
         f"views={metrics['view_count']:,} likes={metrics['favorite_count']:,} "
-        f"RTs={metrics['retweet_count']:,} new_replies={new_replies} new_quotes={new_quotes}",
+        f"RTs={metrics['retweet_count']:,} new_replies={new_replies} new_quotes={new_quotes} "
+        f"retweeters={len(retweeter_list)}",
         flush=True,
     )
 

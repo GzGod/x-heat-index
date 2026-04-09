@@ -101,46 +101,43 @@ def xapi_call(action: str, params: dict, retries: int = 3) -> dict:
 # Parsers (xapi.to flat format)
 # ──────────────────────────────────────────────────────────────
 def parse_xapi_reply(t: dict) -> dict | None:
-    """Convert xapi.to reply/quote item to our internal format.
-
-    tweet_detail replies use: id, author, full_text, is_quote_status
-    search_timeline uses: tweet_id, user, text, is_quote
-    """
-    user = t.get("user") or t.get("author") or {}
-    tid = str(t.get("tweet_id") or t.get("id") or "")
+    """Convert sapi_TweetDetail tweet item to our internal format."""
+    tid = str(t.get("tweet_id") or "")
     if not tid:
         return None
+    user = t.get("user") or {}
     return {
         "tweet_id": tid,
         "author_username": (user.get("screen_name") or "").lower(),
-        "author_followers": user.get("followers_count", 0),
+        "author_followers": int(user.get("followers_count", 0) or 0),
         "author_created_at": user.get("created_at", ""),
-        "text": t.get("text") or t.get("full_text") or "",
+        "text": t.get("text") or "",
         "created_at": t.get("created_at", ""),
-        "view_count": int(t.get("view_count") or t.get("views_count") or 0),
+        "view_count": int(t.get("view_count") or 0),
         "favorite_count": int(t.get("favorite_count") or 0),
         "retweet_count": int(t.get("retweet_count") or 0),
         "reply_count": int(t.get("reply_count") or 0),
         "quote_count": int(t.get("quote_count") or 0),
-        "is_quote": bool(t.get("is_quote") or t.get("is_quote_status")),
+        "is_quote": bool(t.get("is_quote")),
+        "is_reply": bool(t.get("is_reply")),
     }
 
 
 def fetch_sub_replies(parent_tid: str) -> tuple[list[dict], list[dict]]:
-    """Fetch sub-replies and sub-quotes of a parent tweet via tweet_detail.
+    """Fetch sub-replies and sub-quotes of a parent tweet via sapi_TweetDetail.
 
-    Returns (replies, quotes) split by is_quote_status.
+    Returns (replies, quotes).
     """
     try:
-        data = xapi_call("twitter.tweet_detail", {"tweet_id": parent_tid})
+        data = xapi_call("twitter.sapi_TweetDetail", {"params": {"tweet_id": parent_tid}})
     except Exception as e:
-        print(f"[{now_iso()}] WARN: fetch_sub_replies({parent_tid}) failed: {e}", flush=True)
+        print(f"[{now_iso()}] WARN: fetch_sub({parent_tid}) failed: {e}", flush=True)
         return [], []
-    all_items = data.get("data", {}).get("replies") or []
+    tweets = data.get("data", {}).get("tweets") or []
     replies = []
     quotes = []
-    for item in all_items:
-        rec = parse_xapi_reply(item)
+    for t in tweets:
+        rec = parse_xapi_reply(t)
         if rec and rec["tweet_id"] != parent_tid:
             if rec.get("is_quote"):
                 quotes.append(rec)
@@ -244,6 +241,8 @@ def compute_cascade_metrics(
     direct_replies: list[dict],
     direct_quotes: list[dict],
     sub_nodes_by_parent: dict,
+    root_author_followers: int = 0,
+    retweeters: list[dict] | None = None,
 ) -> dict:
     """Walk the full tree, return aggregated metrics.
 
@@ -272,9 +271,24 @@ def compute_cascade_metrics(
     wiener = compute_wiener_index(nodes_by_parent, root_id)
 
     # ── Layered Reach (v2) ──
+    # Start with author's own followers as baseline (L0)
     seen_authors = set()
     reach_gross = 0
-    reach_detail = {"l1_quote": 0, "l1_reply": 0, "l2_quote": 0, "l2_reply": 0}
+    reach_detail = {"l0_author": 0, "l1_quote": 0, "l1_reply": 0, "l1_rt": 0, "l2_quote": 0, "l2_reply": 0}
+
+    # L0 Author — the tweet author's own followers
+    if root_author_followers > 0:
+        reach_gross += root_author_followers
+        reach_detail["l0_author"] = root_author_followers
+
+    # L1 Retweeters — RT appears on retweeter's timeline (full weight)
+    for rt in (retweeters or []):
+        handle = rt.get("username", "")
+        followers = int(rt.get("followers_count", 0) or 0)
+        if handle and handle not in seen_authors:
+            seen_authors.add(handle)
+            reach_gross += followers
+            reach_detail["l1_rt"] += followers
 
     # L1 Quotes — full weight
     for q in direct_quotes:
@@ -433,11 +447,23 @@ def cycle(state: dict) -> None:
     for sn in all_sub_nodes:
         sub_by_parent[sn["parent_id"]].append(sn)
 
+    # Load root metrics for author followers
+    root_metrics = load_jsonl(ROOT_METRICS_FILE)
+    root_author_followers = 0
+    if root_metrics:
+        root_author_followers = int(root_metrics[-1].get("author_followers", 0) or 0)
+
+    # Load retweeters
+    retweeters_file = TWEET_DIR / "retweeters.jsonl"
+    retweeters = load_jsonl(retweeters_file)
+
     metrics = compute_cascade_metrics(
         root_id=TWEET_ID,
         direct_replies=direct_replies,
         direct_quotes=direct_quotes,
         sub_nodes_by_parent=sub_by_parent,
+        root_author_followers=root_author_followers,
+        retweeters=retweeters,
     )
     metrics["ts"] = ts
     metrics["cycle"] = state["cycle_count"]
