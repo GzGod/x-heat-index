@@ -1,0 +1,18 @@
+[Unit]
+Description=x-heat-index frontend dashboard (read-only HTTP server)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/tweet-tracker
+Environment=DATA_DIR=/opt/tweet-tracker/data
+Environment=FRONTEND_PORT=3301
+Environment=FRONTEND_BIND=127.0.0.1
+ExecStart=/usr/bin/python3 /opt/tweet-tracker/frontend.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/tweet-tracker/frontend.log
+StandardError=append:/opt/tweet-tracker/frontend.log
+
+[Install]
+WantedBy=multi-user.target
