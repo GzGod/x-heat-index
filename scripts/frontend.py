@@ -17,14 +17,21 @@ Required env:
 
 import json
 import os
+import subprocess
 import sys
+import threading
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/opt/tweet-tracker/data"))
 PORT = int(os.environ.get("FRONTEND_PORT", "3301"))
-BIND = os.environ.get("FRONTEND_BIND", "127.0.0.1")
+BIND = os.environ.get("FRONTEND_BIND", "0.0.0.0")
+
+# Track running tracker/walker processes per tweet_id
+_running_trackers: dict[str, subprocess.Popen] = {}
+_running_walkers: dict[str, subprocess.Popen] = {}
+_lock = threading.Lock()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -284,7 +291,19 @@ HTML = r"""<!DOCTYPE html>
     <div>
       <h1>x-heat-<span class="accent">index</span><span class="sub">推文传播实时监控</span></h1>
     </div>
-    <select id="tweet-selector"></select>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+      <input id="tweet-url-input" type="text" placeholder="粘贴推文链接开始追踪…" style="
+        background:var(--surface);border:1px solid var(--border);color:var(--text);
+        padding:8px 12px;border-radius:6px;font-family:'SF Mono',Menlo,monospace;
+        font-size:12px;min-width:320px;outline:none;
+      ">
+      <button id="track-btn" onclick="startTracking()" style="
+        background:var(--accent);color:#fff;border:none;padding:8px 16px;
+        border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;
+        white-space:nowrap;
+      ">开始追踪</button>
+      <select id="tweet-selector"></select>
+    </div>
     <div class="meta" id="updated-at">—</div>
   </header>
 
@@ -719,6 +738,58 @@ function wienerLabelZh(w) {
   return "深度传播";
 }
 
+// ── Track new tweet ──
+async function startTracking() {
+  const input = $("tweet-url-input");
+  const btn = $("track-btn");
+  const raw = input.value.trim();
+  if (!raw) return;
+
+  // Extract tweet ID from URL or raw ID
+  let tid = raw;
+  const m = raw.match(/status\/(\d+)/);
+  if (m) tid = m[1];
+  if (!/^\d+$/.test(tid)) {
+    alert("无法识别推文 ID，请粘贴完整推文链接或纯数字 ID");
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "启动中…";
+  try {
+    const resp = await fetch("/api/track", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tweet_id: tid }),
+    });
+    const data = await resp.json();
+    if (data.error) {
+      alert("启动失败: " + data.error);
+    } else {
+      input.value = "";
+      // Refresh tweet list and switch to new tweet
+      currentTid = await renderTweetList();
+      // Select the new one
+      const sel = $("tweet-selector");
+      for (const opt of sel.options) {
+        if (opt.value === tid) { sel.value = tid; break; }
+      }
+      currentTid = tid;
+      renderDashboard(currentTid);
+    }
+  } catch (e) {
+    alert("请求失败: " + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "开始追踪";
+  }
+}
+
+// Allow Enter key in input
+$("tweet-url-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") startTracking();
+});
+
 // ── Main ──
 let currentTid = null;
 async function init() {
@@ -735,6 +806,67 @@ init();
 </body>
 </html>
 """
+
+
+# ──────────────────────────────────────────────────────────────
+# Tracker / Walker process management
+# ──────────────────────────────────────────────────────────────
+def _find_script(name: str) -> str:
+    """Find a sibling script (tracker.py / cascade_walker.py)."""
+    here = Path(__file__).resolve().parent
+    path = here / name
+    if path.exists():
+        return str(path)
+    raise FileNotFoundError(f"Cannot find {name} in {here}")
+
+
+def start_tracker(tweet_id: str) -> dict:
+    """Start tracker + walker for a tweet_id if not already running."""
+    with _lock:
+        # Check if already running
+        if tweet_id in _running_trackers:
+            proc = _running_trackers[tweet_id]
+            if proc.poll() is None:  # still alive
+                return {"status": "already_running", "tweet_id": tweet_id}
+
+        # Ensure data dir exists
+        tweet_dir = DATA_DIR / tweet_id
+        tweet_dir.mkdir(parents=True, exist_ok=True)
+
+        env = {**os.environ, "TWEET_ID": tweet_id, "DATA_DIR": str(DATA_DIR)}
+
+        # Start tracker
+        tracker_script = _find_script("tracker.py")
+        tracker_proc = subprocess.Popen(
+            [sys.executable, tracker_script],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        _running_trackers[tweet_id] = tracker_proc
+
+        # Start walker (with slight delay handled by walker itself)
+        walker_script = _find_script("cascade_walker.py")
+        walker_proc = subprocess.Popen(
+            [sys.executable, walker_script],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        _running_walkers[tweet_id] = walker_proc
+
+        print(f"[frontend] Started tracker (pid={tracker_proc.pid}) + walker (pid={walker_proc.pid}) for {tweet_id}", flush=True)
+        return {"status": "started", "tweet_id": tweet_id}
+
+
+def list_running() -> list:
+    """List currently tracked tweet_ids with process status."""
+    with _lock:
+        out = []
+        for tid, proc in _running_trackers.items():
+            alive = proc.poll() is None
+            out.append({"tweet_id": tid, "tracker_alive": alive})
+        return out
 
 
 # ──────────────────────────────────────────────────────────────
@@ -832,12 +964,35 @@ class Handler(SimpleHTTPRequestHandler):
                     self._send_json({"error": "invalid tweet_id"}, status=400)
                     return
                 self._send_json(load_tweet_data(tid))
+            elif path == "/api/running":
+                self._send_json(list_running())
             elif path == "/health":
                 self._send_json({"status": "ok"})
             else:
                 self.send_error(404)
         except Exception as e:
             print(f"[frontend] ERROR {path}: {e}", file=sys.stderr, flush=True)
+            self._send_json({"error": str(e)}, status=500)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        try:
+            if path == "/api/track":
+                content_length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(content_length)
+                data = json.loads(body) if body else {}
+                tweet_id = str(data.get("tweet_id", "")).strip()
+                if not tweet_id or not tweet_id.isdigit():
+                    self._send_json({"error": "invalid tweet_id"}, status=400)
+                    return
+                result = start_tracker(tweet_id)
+                self._send_json(result)
+            else:
+                self.send_error(404)
+        except Exception as e:
+            print(f"[frontend] ERROR POST {path}: {e}", file=sys.stderr, flush=True)
             self._send_json({"error": str(e)}, status=500)
 
 

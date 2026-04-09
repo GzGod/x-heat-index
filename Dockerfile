@@ -13,6 +13,10 @@ WORKDIR /opt/tweet-tracker
 
 COPY scripts/ ./
 
-# Default: run the frontend (dashboard)
-# Override CMD for tracker or walker via Railway service config
+# Ensure data dir exists
+RUN mkdir -p /opt/tweet-tracker/data
+
+EXPOSE 3301
+
+# Frontend serves dashboard + manages tracker/walker subprocesses
 CMD ["python3", "frontend.py"]
