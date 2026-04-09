@@ -25,7 +25,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/opt/tweet-tracker/data"))
-PORT = int(os.environ.get("FRONTEND_PORT", "3301"))
+PORT = int(os.environ.get("PORT", os.environ.get("FRONTEND_PORT", "3301")))
 BIND = os.environ.get("FRONTEND_BIND", "0.0.0.0")
 
 # Track running tracker/walker processes per tweet_id
