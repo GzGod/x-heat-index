@@ -18,7 +18,7 @@ Required env:
 import json
 import os
 import sys
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -623,28 +623,28 @@ async function renderDashboard(tid) {
       fmt(latest.heat_score || 0),
       "", heatArrow,
       "按 点赞+转发+回复+引用 加权",
-      "一个综合指标：0.2×曝光 + 1×点赞 + 5×转发 + 2×回复 + 3×引用。权重反映参与的"主动性"：转发是主动放大，权重最高；曝光是被动，权重最低。"
+      "一个综合指标：0.2×曝光 + 1×点赞 + 5×转发 + 2×回复 + 3×引用。权重反映参与的「主动性」：转发是主动放大，权重最高；曝光是被动，权重最低。"
     ),
     kpi(
       "当前传播速度",
       (latest.heat_velocity_per_min || 0).toFixed(1),
       "/分", null,
       velocityTierLabel(latest.heat_velocity_per_min),
-      "每分钟热度的增量。0 = 不再传播，10+ = 活跃传播，50+ = 爆发。这是判断"现在是不是还火"的核心指标，不是"总共多火"。"
+      "每分钟热度的增量。0 = 不再传播，10+ = 活跃传播，50+ = 爆发。这是判断「现在是不是还火」的核心指标，不是「总共多火」。"
     ),
     kpi(
       "参与讨论人数",
       fmt(latestCascade.unique_engager_count || 0),
       "人", engagerArrow,
       "独立账户，含回复和引用者",
-      "所有回复、引用原推文及其下层讨论的独立 X 账户数（去重）。包括"回复的回复"，所以大于原推 reply_count。"
+      "所有回复、引用原推文及其下层讨论的独立 X 账户数（去重）。包括「回复的回复」，所以大于原推 reply_count。"
     ),
     kpi(
       "扩散深度",
       (latestCascade.structural_virality_wiener || 0).toFixed(1),
       "", null,
       wienerLabelZh(latestCascade.structural_virality_wiener),
-      "学术上叫 Wiener index（Goel et al. 2016），通俗理解：越接近 1 = 所有人都在"直接回原帖"（浅层广播）；越高 = "有人在回别人的回复"（真·多层讨论）。2-4 之间算健康的树状扩散。"
+      "学术上叫 Wiener index（Goel et al. 2016），通俗理解：越接近 1 = 所有人都在「直接回原帖」（浅层广播）；越高 = 「有人在回别人的回复」（真·多层讨论）。2-4 之间算健康的树状扩散。"
     ),
     kpi(
       "触达上限",
@@ -844,7 +844,7 @@ class Handler(SimpleHTTPRequestHandler):
 def main():
     print(f"[frontend] x-heat-index serving on http://{BIND}:{PORT}", flush=True)
     print(f"[frontend] DATA_DIR={DATA_DIR}", flush=True)
-    httpd = HTTPServer((BIND, PORT), Handler)
+    httpd = ThreadingHTTPServer((BIND, PORT), Handler)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
