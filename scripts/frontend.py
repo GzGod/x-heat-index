@@ -840,8 +840,6 @@ def start_tracker(tweet_id: str) -> dict:
         tracker_proc = subprocess.Popen(
             [sys.executable, tracker_script],
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
         )
         _running_trackers[tweet_id] = tracker_proc
 
@@ -850,8 +848,6 @@ def start_tracker(tweet_id: str) -> dict:
         walker_proc = subprocess.Popen(
             [sys.executable, walker_script],
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
         )
         _running_walkers[tweet_id] = walker_proc
 
