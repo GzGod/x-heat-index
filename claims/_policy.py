@@ -1,13 +1,14 @@
-"""Per-project policy for tweet-tracker claim-runtime."""
+"""Per-project policy for x-heat-index claim-runtime."""
 from claim_runtime import ProjectPolicy
 
 
-class TweetTrackerPolicy(ProjectPolicy):
-    """Policy for tweet-tracker's claim-runtime adoption.
+class XHeatIndexPolicy(ProjectPolicy):
+    """Policy for x-heat-index's claim-runtime adoption.
 
     Two Python daemons (Phase 1: tracker.py, Phase 2: cascade_walker.py)
-    that snapshot a single tweet's engagement over time and compute
-    cascade metrics. Stdlib only — no extra deps.
+    that snapshot a single X tweet's engagement over time and compute
+    a composite heat index (heat + velocity + cascade + reach).
+    Stdlib only — no extra deps.
     """
 
     # Hard claims are human-only — agent cannot silently weaken invariants.

@@ -25,7 +25,7 @@ from claim_runtime import forbid
 
 
 NoHardcodedRapidApiKey = forbid(
-    id="tweet_tracker.hard.no_hardcoded_rapidapi_key",
+    id="x_heat_index.hard.no_hardcoded_rapidapi_key",
     language="python",
     pattern='"*msh*"',
     scope=["scripts"],

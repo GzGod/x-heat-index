@@ -1,10 +1,19 @@
-# tweet-tracker
+# x-heat-index
 
-监控**单条** Twitter 推文 7 天的扩散和热度曲线。给乙方做 promotion 报告
-和 attribution 用。
+**X 平台单推热度指数系统。** 对**单条** X 推文 7 天窗口内的传播做高频
+采样，算出一个综合"热度指数"—— 不是单个 metric 数字，是
+`heat score + velocity + cascade structure + reach` 四个维度合成的
+actionable signal，给乙方做 promotion attribution 和投前投后 lift 报告用。
 
-> **不是**做泛流监测的工具。一个 systemd unit instance 追踪一条推。
-> 想追多条就开多个 instance（template `@<tweet_id>` 让你 zero-config）。
+> **只做 X**（所以叫 x-heat-index，不叫 heat-index）。
+> **单条 tweet 粒度**，不是账号级或话题级流量监测。
+> 一个 systemd unit instance 追一条推。想追多条就开多个 instance
+> （template `@<tweet_id>` 让你 zero-config）。
+
+> **命名说明：** server 上实现层的路径是 `/opt/tweet-tracker/`，systemd
+> template 也叫 `tweet-tracker@.service` + `cascade-walker@.service`。
+> 这些是**历史遗留的实现命名**，没改；product 层面的名字 = x-heat-index。
+> 就像 Orion repo 和 /opt/orion 的关系。
 
 ---
 

@@ -1,18 +1,24 @@
-# tweet-tracker
+# x-heat-index
 
-High-frequency engagement + cascade tracker for individual tweets. Runs as
-two systemd template services on the mango server, one tweet at a time.
+X 平台单推**综合热度指数系统**。对单条 X 推文 7 天窗口内的传播做
+高频采样，输出一个组合了 heat / velocity / cascade structure / reach
+的综合 signal。给乙方做 promotion attribution 和投前投后 lift 报告用。
 
 ## Quick Reference
 
 | 项 | 值 |
 |----|-----|
 | Stack | Python 3.12 stdlib only (urllib, json, socket) — zero deps |
-| 本地路径 | `Projects/tweet-tracker/` |
-| 服务器 | `/opt/tweet-tracker/` (systemd templates: `tweet-tracker@<id>` + `cascade-walker@<id>`) |
+| 本地路径 | `Projects/x-heat-index/` |
+| 服务器 | `/opt/tweet-tracker/` (systemd templates: `tweet-tracker@<id>` + `cascade-walker@<id>`) — **注意**：server paths 保留历史实现命名，未重命名 |
 | 数据 | `/opt/tweet-tracker/data/<tweet_id>/` (JSONL files, no DB) |
 | 部署 | scp `scripts/*.py` → server, no service restart needed (script picks up on next cycle if running, otherwise next start) |
 | API | Twitter241 (RapidAPI) — primary + fallback key auto-switch |
+
+> **Product name vs implementation name**: product = `x-heat-index`
+> (本地 repo 名); 实现 = `tweet-tracker` + `cascade-walker` (server
+> 路径 + systemd unit 名)。重命名 server 会导致重启交易中服务，所以
+> 保持实现层稳定。新代码 / 新 instance 的命名就用 `x-heat-index`。
 
 ## Architecture
 
