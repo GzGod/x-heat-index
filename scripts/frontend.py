@@ -322,7 +322,7 @@ HTML = r"""<!DOCTYPE html>
       <div class="chart-card full">
         <div class="chart-title">热度曲线 & 传播速度</div>
         <div class="chart-desc">
-          橙色实线 = XHI 综合热度（多层加权：基础权重 × 影响力系数 × 时间衰减 + 组合加成）。<br>
+          橙色实线 = 每周期新增热度（越高说明当前时段传播越猛）。<br>
           蓝色虚线 = 当前每分钟新增热度（越高说明正在传播越快；接近 0 = 停滞）。
         </div>
         <div class="chart-wrap"><canvas id="chart-heat"></canvas></div>
@@ -683,8 +683,8 @@ async function renderDashboard(tid) {
 
   makeLineChart("chart-heat", [
     {
-      label: "综合热度",
-      data: derivedPoints(d => d.heat_score || 0),
+      label: "每周期新增热度",
+      data: derivedPoints(d => d.heat_delta || 0),
       borderColor: "#f78166",
       backgroundColor: "rgba(247,129,102,0.12)",
       fill: true,

@@ -636,17 +636,20 @@ def cycle(state: dict, cfg: dict) -> None:
 
     heat_result = compute_heat_v2(metrics, all_replies, all_quotes, post_created_at)
     heat = heat_result["heat_raw"]
+    heat_delta = 0.0
     velocity = 0.0
     if state.get("last_heat") and state.get("last_ts"):
         last_ts_dt = datetime.fromisoformat(state["last_ts"])
         cur_ts_dt = datetime.fromisoformat(ts)
         elapsed_min = (cur_ts_dt - last_ts_dt).total_seconds() / 60.0
+        heat_delta = heat - state["last_heat"]
         if elapsed_min > 0:
-            velocity = (heat - state["last_heat"]) / elapsed_min
+            velocity = heat_delta / elapsed_min
 
     derived = {
         "ts": ts,
         "heat_score": heat,
+        "heat_delta": round(heat_delta, 2),
         "heat_velocity_per_min": velocity,
         "engagement_rate": compute_engagement_rate(metrics),
         "heat_components": heat_result["components"],
