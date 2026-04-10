@@ -270,6 +270,24 @@ def compute_cascade_metrics(
 
     wiener = compute_wiener_index(nodes_by_parent, root_id)
 
+    # ── Engager Count (discussion participants, deduplicated) ──
+    # All people who created content: replies + quotes + sub-replies + sub-quotes
+    # Excludes retweeters (no content creation)
+    engagers = set()
+    for r in direct_replies:
+        handle = r.get("author_username", "")
+        if handle:
+            engagers.add(handle)
+    for q in direct_quotes:
+        handle = q.get("author_username", "")
+        if handle:
+            engagers.add(handle)
+    for parent_id, subs in sub_nodes_by_parent.items():
+        for s in subs:
+            handle = s.get("author_username", "")
+            if handle:
+                engagers.add(handle)
+
     # ── Layered Reach (v2) ──
     # Start with author's own followers as baseline (L0)
     seen_authors = set()
@@ -333,7 +351,7 @@ def compute_cascade_metrics(
         "cascade_max_depth": max_depth,
         "cascade_breadth_per_layer": breadth,
         "structural_virality_wiener": round(wiener, 3),
-        "unique_engager_count": len(seen_authors),
+        "unique_engager_count": len(engagers),
         "reach_gross": reach_gross,
         "reach_adjusted": reach_adjusted,
         "reach_est_impressions": reach_est_impressions,
