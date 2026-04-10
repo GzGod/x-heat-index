@@ -3,40 +3,46 @@
 
 Phase 1 only (Phase 2 cascade walker is a separate script).
 
-Outputs (per tweet, in DATA_DIR/<tweet_id>/):
-  metrics.jsonl   — counts every cycle (views, likes, RTs, replies, quotes, bookmarks)
-  replies.jsonl   — incremental new replies (dedup)
-  quotes.jsonl    — incremental new quotes
-  derived.jsonl   — heat / velocity / reach / engagement_rate per cycle
-  state.json      — seen IDs (for crash recovery)
-  config.json     — promotion start ts, KOL list, channels (manually edited later)
-  dashboard.txt   — human-readable status, overwritten each cycle
-
-API: xapi.to via CLI (npx xapi-to call ...)
+API: Twitter241 (RapidAPI) — supports cursor pagination for replies/quotes.
 
 Required env:
-  XAPI_API_KEY               xapi.to API key (or pre-configured via npx xapi-to config)
-  TWEET_ID                   target tweet ID
+  TWITTER241_RAPIDAPI_KEY    Twitter241 API key
+  TWEET_ID                   target tweet pid
 
 Optional env:
+  TWITTER241_RAPIDAPI_KEY_FALLBACK   optional fallback key
   DATA_DIR                   default /opt/tweet-tracker/data
   SNAPSHOT_INTERVAL_SEC      default 300 (5 min)
+  MAX_PAGES_PER_CYCLE        default 5 (cap pagination per endpoint per cycle)
 """
 
 import json
 import os
-import subprocess
+import socket
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Hard socket timeout
+socket.setdefaulttimeout(20)
 
 # ──────────────────────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────────────────────
+KEY_PRIMARY = os.environ["TWITTER241_RAPIDAPI_KEY"]
+KEY_FALLBACK = os.environ.get("TWITTER241_RAPIDAPI_KEY_FALLBACK", "")
+HOST = "twitter241.p.rapidapi.com"
 TWEET_ID = os.environ["TWEET_ID"]
+
+_active_key = KEY_PRIMARY
+_using_fallback = False
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/opt/tweet-tracker/data"))
 INTERVAL = int(os.environ.get("SNAPSHOT_INTERVAL_SEC", "300"))
+MAX_PAGES = int(os.environ.get("MAX_PAGES_PER_CYCLE", "5"))
 
 TWEET_DIR = DATA_DIR / TWEET_ID
 TWEET_DIR.mkdir(parents=True, exist_ok=True)
@@ -52,278 +58,202 @@ DASHBOARD_FILE = TWEET_DIR / "dashboard.txt"
 # ──────────────────────────────────────────────────────────────
 # XHI™ Signal Weight Framework v2
 # ──────────────────────────────────────────────────────────────
-
-# Layer 1: Base Signal Weights
 W_VIEWS = 0.01
 W_LIKES = 1.0
 W_RTS = 2.0
 W_REPLIES = 3.0
 W_QUOTES = 5.0
-W_QUOTES_WITH_COMMENTARY = 7.0  # Quote with >50 chars commentary
-W_REPLY_CATALYST = 4.5          # Reply that triggers sub-thread (≥3 sub-replies)
-W_BOOKMARKS = 2.0               # Latent interest (when API available)
+W_QUOTES_WITH_COMMENTARY = 7.0
+W_REPLY_CATALYST = 4.5
+W_BOOKMARKS = 2.0
 
-# Layer 2: Quality Multiplier thresholds
 QUALITY_TIERS = [
-    (100_000, 3.0),   # >100K followers: Tier-1 KOL
-    (10_000,  1.5),   # 10K-100K: Mid-tier
-    (1_000,   1.0),   # 1K-10K: baseline
-    (0,       0.8),   # <1K: low influence
+    (100_000, 3.0),
+    (10_000,  1.5),
+    (1_000,   1.0),
+    (0,       0.8),
 ]
-QUALITY_NEW_ACCOUNT_DAYS = 30       # accounts younger than this
+QUALITY_NEW_ACCOUNT_DAYS = 30
 QUALITY_NEW_ACCOUNT_MULTIPLIER = 0.3
 
-# Layer 3: Temporal Decay brackets (hours → multiplier)
 TEMPORAL_DECAY = [
-    (1,   1.0),    # 0-1h: peak window
-    (6,   0.85),   # 1-6h: active propagation
-    (24,  0.5),    # 6-24h: mid-lifecycle
-    (72,  0.2),    # 24-72h: long tail
-    (None, 0.05),  # 72h+: residual
+    (1,   1.0),
+    (6,   0.85),
+    (24,  0.5),
+    (72,  0.2),
+    (None, 0.05),
 ]
 
-# Layer 4: Cross-Signal Interaction Bonus
-BONUS_QUOTE_AND_REPLY = 2.0        # same user quotes + replies
-BONUS_CATALYST_QUOTE = 3.0         # quote triggers ≥3 sub-replies
-BONUS_BURST_QUOTES = 5.0           # ≥3 independent quotes within 10min
-BONUS_RT_TO_QUOTE_UPGRADE = 4.0    # same user RT then quote within 30min
-
-COMMENTARY_MIN_CHARS = 50          # threshold for "Quote with Commentary"
+BONUS_QUOTE_AND_REPLY = 2.0
+BONUS_CATALYST_QUOTE = 3.0
+BONUS_BURST_QUOTES = 5.0
+BONUS_RT_TO_QUOTE_UPGRADE = 4.0
+COMMENTARY_MIN_CHARS = 50
 
 
 # ──────────────────────────────────────────────────────────────
-# xapi.to CLI client
+# Twitter241 HTTP client
 # ──────────────────────────────────────────────────────────────
-def xapi_call(action: str, params: dict, retries: int = 3) -> dict:
-    """Call xapi.to via CLI, return parsed JSON response."""
-    cmd = ["npx", "xapi-to", "call", action, "--input", json.dumps(params)]
+def _switch_to_fallback() -> bool:
+    global _active_key, _using_fallback
+    if _using_fallback or not KEY_FALLBACK:
+        return False
+    _using_fallback = True
+    _active_key = KEY_FALLBACK
+    print(f"[{now_iso()}] [QUOTA] switching to fallback key", flush=True)
+    return True
+
+
+def call_api(path: str, retries: int = 3) -> dict:
+    url = f"https://{HOST}{path}"
     last_err = None
     for attempt in range(retries):
+        headers = {"x-rapidapi-key": _active_key, "x-rapidapi-host": HOST}
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=60,
-            )
-            if result.returncode != 0:
-                last_err = RuntimeError(f"xapi-to exit {result.returncode}: {result.stderr.strip()}")
-                if attempt < retries - 1:
-                    time.sleep(2 ** attempt)
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+                if isinstance(data, dict) and data.get("message", "").lower().startswith("you have exceeded"):
+                    if _switch_to_fallback():
+                        continue
+                    raise RuntimeError(f"quota exhausted: {data.get('message')}")
+                return data
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if e.code == 429:
+                if _switch_to_fallback():
                     continue
-                raise last_err
-            data = json.loads(result.stdout)
-            if not data.get("success", True):
-                err = data.get("error", {})
-                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                raise RuntimeError(f"xapi error: {msg}")
-            return data
-        except subprocess.TimeoutExpired:
-            last_err = RuntimeError("xapi-to call timed out (60s)")
+                time.sleep(2 ** attempt)
+                continue
+            if e.code in (502, 503, 504) and attempt < retries - 1:
+                time.sleep(2 ** attempt)
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_err = e
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
                 continue
-        except json.JSONDecodeError as e:
-            last_err = RuntimeError(f"xapi-to returned invalid JSON: {e}")
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)
-                continue
-    raise last_err or RuntimeError("xapi_call failed")
+            raise
+        except Exception as e:
+            last_err = e
+            raise
+    raise RuntimeError(f"call_api failed: {last_err}")
 
 
 # ──────────────────────────────────────────────────────────────
-# Parsers (xapi.to sapi_* format — flat, with user object)
+# Parsers (Twitter241 nested format)
 # ──────────────────────────────────────────────────────────────
-def parse_sapi_tweet(t: dict) -> dict:
-    """Convert sapi_TweetDetail tweet to our internal flat format."""
-    user = t.get("user") or {}
-    return {
-        "tweet_id": str(t.get("tweet_id") or ""),
-        "author_username": (user.get("screen_name") or "").lower(),
-        "author_followers": int(user.get("followers_count", 0) or 0),
-        "author_created_at": user.get("created_at", ""),
-        "text": t.get("text") or "",
-        "created_at": t.get("created_at", ""),
-        "view_count": int(t.get("view_count") or 0),
-        "favorite_count": int(t.get("favorite_count") or 0),
-        "retweet_count": int(t.get("retweet_count") or 0),
-        "reply_count": int(t.get("reply_count") or 0),
-        "quote_count": int(t.get("quote_count") or 0),
-        "bookmark_count": int(t.get("bookmark_count") or 0),
-        "is_reply": bool(t.get("is_reply")),
-        "is_quote": bool(t.get("is_quote")),
-    }
-
-
-def parse_graphql_retweeter(entry: dict) -> dict | None:
-    """Parse a graphql Retweeters entry into {username, followers_count}."""
-    result = (entry.get("content", {})
-              .get("itemContent", {})
-              .get("user_results", {})
-              .get("result", {}))
-    if not result or result.get("__typename") != "User":
+def parse_tweet_node(node: dict) -> dict | None:
+    if not node or node.get("__typename") not in ("Tweet", None):
         return None
-    legacy = result.get("legacy") or {}
+    legacy = node.get("legacy") or {}
+    if not legacy:
+        return None
+    user_result = node.get("core", {}).get("user_results", {}).get("result", {}) or {}
+    user_legacy = user_result.get("legacy") or {}
+    user_core = user_result.get("core") or {}
+    screen_name = user_core.get("screen_name") or user_legacy.get("screen_name") or ""
+
+    views_count = 0
+    views = node.get("views") or {}
+    if views.get("count"):
+        try:
+            views_count = int(views["count"])
+        except (TypeError, ValueError):
+            pass
+
     return {
-        "username": (legacy.get("screen_name") or "").lower(),
-        "followers_count": int(legacy.get("followers_count", 0) or 0),
+        "tweet_id": str(node.get("rest_id") or legacy.get("id_str", "")),
+        "author_username": screen_name.lower(),
+        "author_followers": user_legacy.get("followers_count", 0),
+        "author_created_at": user_legacy.get("created_at", ""),
+        "text": legacy.get("full_text", ""),
         "created_at": legacy.get("created_at", ""),
+        "view_count": views_count,
+        "favorite_count": legacy.get("favorite_count", 0),
+        "retweet_count": legacy.get("retweet_count", 0),
+        "reply_count": legacy.get("reply_count", 0),
+        "quote_count": legacy.get("quote_count", 0),
+        "bookmark_count": legacy.get("bookmark_count", 0),
     }
 
 
-def fetch_tweet_detail_paged() -> tuple[dict | None, list[dict]]:
-    """Fetch root tweet + all replies via sapi_TweetDetail with cursor pagination.
-
-    Returns (root_metrics, all_reply_records).
-    """
-    root = None
-    all_replies = []
-    cursor = ""
-    max_pages = 5
-
-    for page in range(max_pages):
-        params = {"tweet_id": TWEET_ID}
-        if cursor:
-            params["cursor"] = cursor
-        try:
-            data = xapi_call("twitter.sapi_TweetDetail", {"params": params})
-        except Exception as e:
-            print(f"[{now_iso()}] WARN: sapi_TweetDetail page={page} failed: {e}", flush=True)
-            break
-
-        resp = data.get("data", {})
-        tweets = resp.get("tweets") or []
-
-        for t in tweets:
-            tid = str(t.get("tweet_id") or "")
-            if tid == TWEET_ID and root is None:
-                root = parse_sapi_tweet(t)
-            elif tid and tid != TWEET_ID:
-                rec = parse_sapi_tweet(t)
-                # Only keep direct replies to the root tweet
-                if rec["is_reply"] and str(t.get("related_tweet_id") or "") == TWEET_ID:
-                    all_replies.append(rec)
-
-        cursor = resp.get("next_cursor_str") or ""
-        if not cursor:
-            break
-
-    return root, all_replies
+def _parse_item_content(ic: dict, root_tid: str) -> dict | None:
+    result = ic.get("tweet_results", {}).get("result", ) or {}
+    if result.get("__typename") == "TweetWithVisibilityResults":
+        result = result.get("tweet", {}) or {}
+    rec = parse_tweet_node(result)
+    if rec and rec.get("tweet_id") and rec["tweet_id"] != root_tid:
+        return rec
+    return None
 
 
-def fetch_quotes_paged() -> list[dict]:
-    """Fetch all quotes via sapi_Quotes with cursor pagination."""
-    all_quotes = []
-    cursor = ""
-    max_pages = 5
-
-    for page in range(max_pages):
-        params = {"tweet_id": TWEET_ID}
-        if cursor:
-            params["cursor"] = cursor
-        try:
-            data = xapi_call("twitter.sapi_Quotes", {"params": params})
-        except Exception as e:
-            print(f"[{now_iso()}] WARN: sapi_Quotes page={page} failed: {e}", flush=True)
-            break
-
-        resp = data.get("data", {})
-        tweets = resp.get("tweets") or []
-
-        for t in tweets:
-            rec = parse_sapi_tweet(t)
-            if rec["tweet_id"] and rec["tweet_id"] != TWEET_ID:
-                rec["is_quote"] = True  # force flag since these are all quotes
-                all_quotes.append(rec)
-
-        cursor = resp.get("next_cursor_str") or ""
-        if not cursor:
-            break
-
-    return all_quotes
-
-
-def fetch_retweeters() -> list[dict]:
-    """Fetch retweeter user profiles via graphql_Retweeters."""
-    all_retweeters = []
-    cursor = ""
-    max_pages = 3
-
-    for page in range(max_pages):
-        variables = {"tweetId": TWEET_ID, "count": 100, "includePromotedContent": False}
-        if cursor:
-            variables["cursor"] = cursor
-        try:
-            data = xapi_call("twitter.graphql_Retweeters", {
-                "params": {"variables": json.dumps(variables)}
-            })
-        except Exception as e:
-            print(f"[{now_iso()}] WARN: graphql_Retweeters page={page} failed: {e}", flush=True)
-            break
-
-        resp = data.get("data", {}).get("data", {})
-        instructions = (resp.get("retweeters_timeline", {})
-                        .get("timeline", {})
-                        .get("instructions", []))
-
-        found_cursor = ""
-        for inst in instructions:
-            for entry in inst.get("entries", []):
-                eid = entry.get("entryId", "")
-                if "cursor-bottom" in eid:
-                    found_cursor = (entry.get("content", {}).get("value") or "")
-                    continue
-                user = parse_graphql_retweeter(entry)
-                if user:
-                    all_retweeters.append(user)
-
-        cursor = found_cursor
-        if not cursor:
-            break
-
-    return all_retweeters
+def extract_tweets_from_instructions(instructions: list, root_tid: str) -> tuple[list[dict], str | None]:
+    tweets = []
+    next_cursor = None
+    for inst in instructions or []:
+        for entry in inst.get("entries", []):
+            eid = entry.get("entryId", "")
+            content = entry.get("content", {}) or {}
+            if "cursor-bottom" in eid:
+                next_cursor = content.get("value") or content.get("itemContent", {}).get("value")
+                continue
+            if "cursor" in eid:
+                continue
+            if eid.startswith("tweet-"):
+                rec = _parse_item_content(content.get("itemContent", {}), root_tid)
+                if rec:
+                    tweets.append(rec)
+            elif eid.startswith("conversationthread-"):
+                for item in content.get("items", []):
+                    item_inner = item.get("item", {}) or {}
+                    rec = _parse_item_content(item_inner.get("itemContent", {}), root_tid)
+                    if rec:
+                        tweets.append(rec)
+    return tweets, next_cursor
 
 
 # ──────────────────────────────────────────────────────────────
-# State
+# Fetch functions (Twitter241 with pagination)
 # ──────────────────────────────────────────────────────────────
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {
-        "started_at": now_iso(),
-        "last_metrics": None,
-        "last_heat": 0.0,
-        "last_ts": None,
-        "seen_reply_ids": [],
-        "seen_quote_ids": [],
-        "cycle_count": 0,
-    }
+def fetch_root_metrics() -> dict | None:
+    data = call_api(f"/tweet?pid={TWEET_ID}")
+    inst = (data.get("data", {})
+            .get("threaded_conversation_with_injections_v2", {})
+            .get("instructions", []))
+    for i in inst:
+        for entry in i.get("entries", []):
+            if entry.get("entryId") == f"tweet-{TWEET_ID}":
+                content = entry.get("content", {}) or {}
+                result = (content.get("itemContent", {})
+                          .get("tweet_results", {}).get("result", {}))
+                if result.get("__typename") == "TweetWithVisibilityResults":
+                    result = result.get("tweet", {})
+                return parse_tweet_node(result)
+    return None
 
 
-def save_state(state: dict) -> None:
-    tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, indent=2))
-    tmp.replace(STATE_FILE)
+def fetch_replies_page(cursor: str = "") -> tuple[list[dict], str | None]:
+    path = f"/comments?pid={TWEET_ID}&count=20"
+    if cursor:
+        path += f"&cursor={urllib.parse.quote(cursor)}"
+    data = call_api(path)
+    inst = data.get("result", {}).get("instructions", [])
+    return extract_tweets_from_instructions(inst, TWEET_ID)
 
 
-def load_config() -> dict:
-    if CONFIG_FILE.exists():
-        return json.loads(CONFIG_FILE.read_text())
-    return {
-        "tweet_id": TWEET_ID,
-        "tracker_started_at": now_iso(),
-        "promotion_started_at": None,  # set this when promotion goes live
-        "promotion_kol_handles": [],   # lowercase usernames
-        "promotion_channels": [],      # ["paid-ads", "telegram", ...]
-        "promotion_budget_usd": None,
-        "notes": "",
-    }
-
-
-def save_config(cfg: dict) -> None:
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+def fetch_quotes_page(cursor: str = "") -> tuple[list[dict], str | None]:
+    path = f"/quotes?pid={TWEET_ID}&count=20"
+    if cursor:
+        path += f"&cursor={urllib.parse.quote(cursor)}"
+    data = call_api(path)
+    inst = data.get("result", {}).get("timeline", {}).get("instructions", [])
+    return extract_tweets_from_instructions(inst, TWEET_ID)
 
 
 # ──────────────────────────────────────────────────────────────
-# Helpers
+# State & Helpers
 # ──────────────────────────────────────────────────────────────
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -350,19 +280,57 @@ def load_jsonl(path: Path) -> list[dict]:
     return out
 
 
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {
+        "started_at": now_iso(),
+        "last_metrics": None, "last_heat": 0.0, "last_ts": None,
+        "replies_cursor": "", "quotes_cursor": "",
+        "seen_reply_ids": [], "seen_quote_ids": [],
+        "cycle_count": 0,
+    }
+
+
+def save_state(state: dict) -> None:
+    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(STATE_FILE)
+
+
+def load_config() -> dict:
+    if CONFIG_FILE.exists():
+        return json.loads(CONFIG_FILE.read_text())
+    return {
+        "tweet_id": TWEET_ID, "tracker_started_at": now_iso(),
+        "promotion_started_at": None, "promotion_kol_handles": [],
+        "promotion_channels": [], "promotion_budget_usd": None, "notes": "",
+    }
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+
+
+def is_promoted(handle: str, cfg: dict) -> bool:
+    if not handle:
+        return False
+    return handle.lower() in [h.lower().lstrip("@") for h in cfg.get("promotion_kol_handles", [])]
+
+
+# ──────────────────────────────────────────────────────────────
+# XHI v2 Scoring
+# ──────────────────────────────────────────────────────────────
 def quality_multiplier(followers: int, account_created_at: str = "") -> float:
-    """Layer 2: compute quality multiplier from follower count and account age."""
     q = 1.0
     for threshold, mult in QUALITY_TIERS:
         if followers >= threshold:
             q = mult
             break
-    # New account penalty
     if account_created_at:
         try:
             created = datetime.strptime(account_created_at, "%a %b %d %H:%M:%S %z %Y")
-            age_days = (datetime.now(timezone.utc) - created).days
-            if age_days < QUALITY_NEW_ACCOUNT_DAYS:
+            if (datetime.now(timezone.utc) - created).days < QUALITY_NEW_ACCOUNT_DAYS:
                 q *= QUALITY_NEW_ACCOUNT_MULTIPLIER
         except (ValueError, TypeError):
             pass
@@ -370,7 +338,6 @@ def quality_multiplier(followers: int, account_created_at: str = "") -> float:
 
 
 def temporal_decay(post_created_at: str, action_time: str) -> float:
-    """Layer 3: compute temporal decay based on hours since post creation."""
     try:
         t_post = datetime.strptime(post_created_at, "%a %b %d %H:%M:%S %z %Y")
         t_action = datetime.fromisoformat(action_time)
@@ -384,24 +351,14 @@ def temporal_decay(post_created_at: str, action_time: str) -> float:
 
 
 def quote_base_weight(text: str) -> float:
-    """Determine base weight for a quote: standard or with commentary."""
-    if len(text or "") > COMMENTARY_MIN_CHARS:
-        return W_QUOTES_WITH_COMMENTARY
-    return W_QUOTES
+    return W_QUOTES_WITH_COMMENTARY if len(text or "") > COMMENTARY_MIN_CHARS else W_QUOTES
 
 
-def compute_interaction_bonus(replies: list, quotes: list, post_created_at: str) -> float:
-    """Layer 4: cross-signal interaction bonuses."""
+def compute_interaction_bonus(replies: list, quotes: list) -> float:
     bonus = 0.0
-
     reply_authors = {r.get("author_username", "") for r in replies if r.get("author_username")}
     quote_authors = {q.get("author_username", "") for q in quotes if q.get("author_username")}
-
-    # Bonus: same user quote + reply
-    overlap = reply_authors & quote_authors
-    bonus += len(overlap) * BONUS_QUOTE_AND_REPLY
-
-    # Bonus: burst quotes (≥3 independent quotes within 10min window)
+    bonus += len(reply_authors & quote_authors) * BONUS_QUOTE_AND_REPLY
     quote_times = []
     for q in quotes:
         try:
@@ -411,79 +368,41 @@ def compute_interaction_bonus(replies: list, quotes: list, post_created_at: str)
             continue
     quote_times.sort()
     for i in range(len(quote_times) - 2):
-        window = (quote_times[i + 2] - quote_times[i]).total_seconds()
-        if window <= 600:  # 10 minutes
+        if (quote_times[i + 2] - quote_times[i]).total_seconds() <= 600:
             bonus += BONUS_BURST_QUOTES
-            break  # count once per cycle
-
+            break
     return bonus
 
 
-def compute_heat_v2(
-    metrics: dict,
-    replies: list,
-    quotes: list,
-    post_created_at: str = "",
-) -> dict:
-    """XHI v2 multi-layer heat scoring.
-
-    Returns dict with heat_raw, component breakdown, and bonus.
-    """
-    # Views baseline (no quality multiplier, no decay for aggregate count)
+def compute_heat_v2(metrics: dict, replies: list, quotes: list, post_created_at: str = "") -> dict:
     views_score = W_VIEWS * metrics["view_count"]
-
-    # Likes baseline (aggregate — no per-user data available)
     likes_score = W_LIKES * metrics["favorite_count"]
-
-    # RTs baseline (aggregate — no per-user data available)
     rts_score = W_RTS * metrics["retweet_count"]
 
-    # Per-reply scoring with quality + decay
     replies_score = 0.0
     for r in replies:
-        w = W_REPLIES
-        q = quality_multiplier(
-            int(r.get("author_followers", 0) or 0),
-            r.get("author_created_at", "") or r.get("created_at", ""),
-        )
+        q = quality_multiplier(int(r.get("author_followers", 0) or 0), r.get("author_created_at", ""))
         d = temporal_decay(post_created_at, r.get("fetched_at", ""))
-        replies_score += w * q * d
+        replies_score += W_REPLIES * q * d
+    replies_score += max(0, metrics["reply_count"] - len(replies)) * W_REPLIES
 
-    # Fallback: if aggregate reply_count > len(replies), add remainder at base weight
-    tracked_reply_count = len(replies)
-    untracked_replies = max(0, metrics["reply_count"] - tracked_reply_count)
-    replies_score += untracked_replies * W_REPLIES
-
-    # Per-quote scoring with quality + decay + commentary detection
     quotes_score = 0.0
     for q in quotes:
         w = quote_base_weight(q.get("text", ""))
-        qm = quality_multiplier(
-            int(q.get("author_followers", 0) or 0),
-            q.get("author_created_at", "") or q.get("created_at", ""),
-        )
+        qm = quality_multiplier(int(q.get("author_followers", 0) or 0), q.get("author_created_at", ""))
         d = temporal_decay(post_created_at, q.get("fetched_at", ""))
         quotes_score += w * qm * d
+    quotes_score += max(0, metrics["quote_count"] - len(quotes)) * W_QUOTES
 
-    # Fallback for untracked quotes
-    tracked_quote_count = len(quotes)
-    untracked_quotes = max(0, metrics["quote_count"] - tracked_quote_count)
-    quotes_score += untracked_quotes * W_QUOTES
-
-    # Layer 4: interaction bonus
-    bonus = compute_interaction_bonus(replies, quotes, post_created_at)
-
+    bonus = compute_interaction_bonus(replies, quotes)
     heat_raw = views_score + likes_score + rts_score + replies_score + quotes_score + bonus
 
     return {
         "heat_raw": heat_raw,
         "components": {
-            "views": round(views_score, 2),
-            "likes": round(likes_score, 2),
-            "rts": round(rts_score, 2),
-            "replies": round(replies_score, 2),
-            "quotes": round(quotes_score, 2),
-            "bonus": round(bonus, 2),
+            "views": round(views_score, 2), "likes": round(likes_score, 2),
+            "rts": round(rts_score, 2), "replies": round(replies_score, 2),
+            "quotes": round(quotes_score, 2), "bonus": round(bonus, 2),
         },
     }
 
@@ -491,145 +410,115 @@ def compute_heat_v2(
 def compute_engagement_rate(m: dict) -> float:
     if m["view_count"] == 0:
         return 0.0
-    eng = m["favorite_count"] + m["retweet_count"] + m["reply_count"] + m["quote_count"]
-    return eng / m["view_count"]
-
-
-def is_promoted(handle: str, cfg: dict) -> bool:
-    if not handle:
-        return False
-    return handle.lower() in [h.lower().lstrip("@") for h in cfg.get("promotion_kol_handles", [])]
+    return (m["favorite_count"] + m["retweet_count"] + m["reply_count"] + m["quote_count"]) / m["view_count"]
 
 
 # ──────────────────────────────────────────────────────────────
 # Dashboard
 # ──────────────────────────────────────────────────────────────
-def render_dashboard(metrics: dict, derived: dict, state: dict, cfg: dict, new_replies: int, new_quotes: int) -> str:
-    lines = []
-    lines.append("═" * 60)
-    lines.append(f" XHI Tweet Tracker — {TWEET_ID}")
-    lines.append(f" Updated: {derived['ts']}")
-    lines.append(f" API: xapi.to")
-    lines.append("═" * 60)
-    lines.append("")
-    lines.append(f" Author:        @{metrics.get('author_username', '?')} ({metrics.get('author_followers', 0):,} followers)")
-    lines.append(f" Cycle:         #{state['cycle_count']}")
-    lines.append(f" Tracker age:   {state['started_at']} → now")
-    lines.append("")
-    lines.append("─" * 60)
-    lines.append(" Raw counts")
-    lines.append("─" * 60)
-    lines.append(f"  views:     {metrics['view_count']:>12,}")
-    lines.append(f"  likes:     {metrics['favorite_count']:>12,}")
-    lines.append(f"  retweets:  {metrics['retweet_count']:>12,}")
-    lines.append(f"  replies:   {metrics['reply_count']:>12,}  (+{new_replies} new this cycle)")
-    lines.append(f"  quotes:    {metrics['quote_count']:>12,}  (+{new_quotes} new this cycle)")
-    lines.append(f"  bookmarks: {metrics['bookmark_count']:>12,}")
-    lines.append("")
-    lines.append("─" * 60)
-    lines.append(" Derived (XHI v2)")
-    lines.append("─" * 60)
-    lines.append(f"  Heat Score:        {derived['heat_score']:>12,.0f}")
-    lines.append(f"  Heat Velocity:     {derived['heat_velocity_per_min']:>12,.1f}  per minute")
-    lines.append(f"  Engagement Rate:   {derived['engagement_rate']:>12,.2%}")
+def render_dashboard(metrics, derived, state, cfg, new_replies, new_quotes):
+    lines = [
+        "═" * 60,
+        f" XHI Tweet Tracker — {TWEET_ID}",
+        f" Updated: {derived['ts']}",
+        f" API: Twitter241",
+        "═" * 60, "",
+        f" Author:        @{metrics.get('author_username', '?')} ({metrics.get('author_followers', 0):,} followers)",
+        f" Cycle:         #{state['cycle_count']}",
+        f" Tracker age:   {state['started_at']} → now", "",
+        "─" * 60, " Raw counts", "─" * 60,
+        f"  views:     {metrics['view_count']:>12,}",
+        f"  likes:     {metrics['favorite_count']:>12,}",
+        f"  retweets:  {metrics['retweet_count']:>12,}",
+        f"  replies:   {metrics['reply_count']:>12,}  (+{new_replies} new)",
+        f"  quotes:    {metrics['quote_count']:>12,}  (+{new_quotes} new)",
+        f"  bookmarks: {metrics['bookmark_count']:>12,}", "",
+        "─" * 60, " Derived (XHI v2)", "─" * 60,
+        f"  Heat Score:        {derived['heat_score']:>12,.0f}",
+        f"  Heat Delta:        {derived['heat_delta']:>12,.1f}",
+        f"  Heat Velocity:     {derived['heat_velocity_per_min']:>12,.1f}  per minute",
+        f"  Engagement Rate:   {derived['engagement_rate']:>12,.2%}",
+    ]
     components = derived.get("heat_components", {})
     if components:
-        lines.append("")
-        lines.append("  Score breakdown:")
-        lines.append(f"    views:   {components.get('views', 0):>10,.1f}")
-        lines.append(f"    likes:   {components.get('likes', 0):>10,.1f}")
-        lines.append(f"    RTs:     {components.get('rts', 0):>10,.1f}")
-        lines.append(f"    replies: {components.get('replies', 0):>10,.1f}")
-        lines.append(f"    quotes:  {components.get('quotes', 0):>10,.1f}")
-        lines.append(f"    bonus:   {components.get('bonus', 0):>10,.1f}")
-    lines.append("")
-    lines.append("─" * 60)
-    lines.append(" Promotion config")
-    lines.append("─" * 60)
-    if cfg.get("promotion_started_at"):
-        lines.append(f"  Status:        ACTIVE since {cfg['promotion_started_at']}")
-        lines.append(f"  KOL list:      {len(cfg.get('promotion_kol_handles', []))} accounts")
-        lines.append(f"  Channels:      {', '.join(cfg.get('promotion_channels', []) or ['(none)'])}")
-    else:
-        lines.append(f"  Status:        NOT YET STARTED (collecting baseline)")
-        lines.append(f"  Edit {CONFIG_FILE} to mark promotion start.")
-    lines.append("")
-    lines.append("─" * 60)
-    lines.append(" Files")
-    lines.append("─" * 60)
-    lines.append(f"  metrics:   {METRICS_FILE} ({METRICS_FILE.stat().st_size if METRICS_FILE.exists() else 0:,} bytes)")
-    lines.append(f"  replies:   {REPLIES_FILE} ({len(state['seen_reply_ids'])} total)")
-    lines.append(f"  quotes:    {QUOTES_FILE} ({len(state['seen_quote_ids'])} total)")
-    lines.append(f"  derived:   {DERIVED_FILE}")
-    lines.append("═" * 60)
+        lines += ["", "  Score breakdown:"]
+        for k in ("views", "likes", "rts", "replies", "quotes", "bonus"):
+            lines.append(f"    {k:8s} {components.get(k, 0):>10,.1f}")
+    lines += ["", "═" * 60]
     return "\n".join(lines) + "\n"
 
 
 # ──────────────────────────────────────────────────────────────
 # Main loop
 # ──────────────────────────────────────────────────────────────
-def cycle(state: dict, cfg: dict) -> None:
-    """Run one snapshot cycle."""
+def cycle(state, cfg):
     ts = now_iso()
     state["cycle_count"] += 1
 
-    # Fetch tweet detail with pagination (metrics + replies)
-    metrics, reply_list = fetch_tweet_detail_paged()
+    metrics = fetch_root_metrics()
     if not metrics:
-        print(f"[{ts}] WARN: failed to fetch tweet detail, skipping cycle", flush=True)
+        print(f"[{ts}] WARN: failed to fetch root metrics, skipping", flush=True)
         return
     metrics["ts"] = ts
     append_jsonl(METRICS_FILE, metrics)
 
-    # Fetch quotes (separate endpoint with pagination)
-    quote_list = fetch_quotes_paged()
-
-    # Fetch retweeters (user profiles with follower counts)
-    retweeter_list = fetch_retweeters()
-    if retweeter_list:
-        # Save retweeters to a dedicated file for reach calculation
-        retweeters_file = TWEET_DIR / "retweeters.jsonl"
-        seen_rt = set()
-        if retweeters_file.exists():
-            for line in retweeters_file.read_text().splitlines():
-                try:
-                    seen_rt.add(json.loads(line).get("username", ""))
-                except json.JSONDecodeError:
-                    pass
-        for rt in retweeter_list:
-            if rt["username"] and rt["username"] not in seen_rt:
-                seen_rt.add(rt["username"])
-                append_jsonl(retweeters_file, {**rt, "fetched_at": ts})
-
-    # Process replies
+    # Fetch replies (paginated)
     seen_replies = set(state["seen_reply_ids"])
     new_replies = 0
-    for t in reply_list:
-        tid = t["tweet_id"]
-        if not tid or tid in seen_replies:
-            continue
-        seen_replies.add(tid)
-        t["fetched_at"] = ts
-        t["is_promoted_kol"] = is_promoted(t.get("author_username", ""), cfg)
-        append_jsonl(REPLIES_FILE, t)
-        new_replies += 1
+    cursor = state.get("replies_cursor", "") or ""
+    for page in range(MAX_PAGES):
+        try:
+            tweets, next_cursor = fetch_replies_page(cursor)
+        except Exception as e:
+            print(f"[{ts}] WARN: replies page={page}: {e}", flush=True)
+            break
+        if not tweets:
+            break
+        any_new = False
+        for t in tweets:
+            tid = t["tweet_id"]
+            if tid and tid not in seen_replies:
+                seen_replies.add(tid)
+                t["fetched_at"] = ts
+                t["is_promoted_kol"] = is_promoted(t.get("author_username", ""), cfg)
+                append_jsonl(REPLIES_FILE, t)
+                new_replies += 1
+                any_new = True
+        if not any_new or not next_cursor:
+            break
+        cursor = next_cursor
+    state["replies_cursor"] = cursor
     state["seen_reply_ids"] = list(seen_replies)
 
-    # Process quotes (from sapi_Quotes endpoint)
+    # Fetch quotes (paginated)
     seen_quotes = set(state["seen_quote_ids"])
     new_quotes = 0
-    for t in quote_list:
-        tid = t["tweet_id"]
-        if not tid or tid in seen_quotes:
-            continue
-        seen_quotes.add(tid)
-        t["fetched_at"] = ts
-        t["is_promoted_kol"] = is_promoted(t.get("author_username", ""), cfg)
-        append_jsonl(QUOTES_FILE, t)
-        new_quotes += 1
+    cursor = state.get("quotes_cursor", "") or ""
+    for page in range(MAX_PAGES):
+        try:
+            tweets, next_cursor = fetch_quotes_page(cursor)
+        except Exception as e:
+            print(f"[{ts}] WARN: quotes page={page}: {e}", flush=True)
+            break
+        if not tweets:
+            break
+        any_new = False
+        for t in tweets:
+            tid = t["tweet_id"]
+            if tid and tid not in seen_quotes:
+                seen_quotes.add(tid)
+                t["fetched_at"] = ts
+                t["is_promoted_kol"] = is_promoted(t.get("author_username", ""), cfg)
+                append_jsonl(QUOTES_FILE, t)
+                new_quotes += 1
+                any_new = True
+        if not any_new or not next_cursor:
+            break
+        cursor = next_cursor
+    state["quotes_cursor"] = cursor
     state["seen_quote_ids"] = list(seen_quotes)
 
-    # Compute derived metrics (XHI v2: multi-layer scoring)
+    # XHI v2 scoring
     all_replies = load_jsonl(REPLIES_FILE)
     all_quotes = load_jsonl(QUOTES_FILE)
     post_created_at = metrics.get("created_at", "")
@@ -647,9 +536,7 @@ def cycle(state: dict, cfg: dict) -> None:
             velocity = heat_delta / elapsed_min
 
     derived = {
-        "ts": ts,
-        "heat_score": heat,
-        "heat_delta": round(heat_delta, 2),
+        "ts": ts, "heat_score": heat, "heat_delta": round(heat_delta, 2),
         "heat_velocity_per_min": velocity,
         "engagement_rate": compute_engagement_rate(metrics),
         "heat_components": heat_result["components"],
@@ -671,33 +558,32 @@ def cycle(state: dict, cfg: dict) -> None:
     state["last_metrics"] = metrics
     save_state(state)
 
-    # Render dashboard
     DASHBOARD_FILE.write_text(render_dashboard(metrics, derived, state, cfg, new_replies, new_quotes))
 
     print(
-        f"[{ts}] cycle #{state['cycle_count']}: heat={heat:.0f} velocity={velocity:.1f}/min "
-        f"views={metrics['view_count']:,} likes={metrics['favorite_count']:,} "
-        f"RTs={metrics['retweet_count']:,} new_replies={new_replies} new_quotes={new_quotes} "
-        f"retweeters={len(retweeter_list)}",
+        f"[{ts}] cycle #{state['cycle_count']}: heat={heat:.0f} delta={heat_delta:.0f} "
+        f"velocity={velocity:.1f}/min views={metrics['view_count']:,} "
+        f"likes={metrics['favorite_count']:,} RTs={metrics['retweet_count']:,} "
+        f"new_replies={new_replies} new_quotes={new_quotes}",
         flush=True,
     )
 
 
 def main():
-    print(f"=== XHI Tweet Tracker started ===", flush=True)
+    print("=== XHI Tweet Tracker started ===", flush=True)
     print(f"  TWEET_ID:  {TWEET_ID}", flush=True)
     print(f"  DATA_DIR:  {TWEET_DIR}", flush=True)
     print(f"  INTERVAL:  {INTERVAL}s", flush=True)
-    print(f"  API:       xapi.to", flush=True)
+    print(f"  API:       Twitter241", flush=True)
 
     state = load_state()
     cfg = load_config()
-    save_config(cfg)  # ensure file exists
+    save_config(cfg)
 
     while True:
         try:
             cycle(state, cfg)
-            cfg = load_config()  # reload in case promotion config was edited
+            cfg = load_config()
         except Exception as e:
             print(f"[{now_iso()}] ERROR cycle: {e}", flush=True)
             import traceback

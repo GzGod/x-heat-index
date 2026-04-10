@@ -5,11 +5,11 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/tweet-tracker
-Environment=XAPI_API_KEY=sk-ae375f79914f27c6e29ec9aaad09448378b133df175bcac4
+Environment=TWITTER241_RAPIDAPI_KEY=YOUR_KEY_HERE
 Environment=TWEET_ID=%i
 Environment=DATA_DIR=/opt/tweet-tracker/data
 Environment=SNAPSHOT_INTERVAL_SEC=300
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=MAX_PAGES_PER_CYCLE=5
 ExecStart=/usr/bin/python3 /opt/tweet-tracker/tracker.py
 Restart=always
 RestartSec=10
