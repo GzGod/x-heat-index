@@ -196,7 +196,10 @@ def fetch_tweet_detail_paged() -> tuple[dict | None, list[dict]]:
             if tid == TWEET_ID and root is None:
                 root = parse_sapi_tweet(t)
             elif tid and tid != TWEET_ID:
-                all_replies.append(parse_sapi_tweet(t))
+                rec = parse_sapi_tweet(t)
+                # Only keep direct replies to the root tweet
+                if rec["is_reply"] and str(t.get("related_tweet_id") or "") == TWEET_ID:
+                    all_replies.append(rec)
 
         cursor = resp.get("next_cursor_str") or ""
         if not cursor:
